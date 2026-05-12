@@ -1,0 +1,1313 @@
+---
+title: "4)ITS"
+---
+
+
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(ape)
+library(decontam)
+library(picante)
+library(vegan)
+library(patchwork)
+library(ggpubr)
+library(biomformat)
+library(broom)
+library(ANCOMBC)
+library(stringr)
+
+set.seed(456)
+
+```
+
+
+```{r}
+# 1) Import
+
+
+metadata_ITS <- import_qiime_sample_data(
+  "Dataset_ITS_EmysOrbicularis_Meyer.tsv"
+)
+
+biom_ITS <- import_biom(
+  "ITS1_PondTurtles_Autumn_2024_withtax_json.biom"
+)
+
+tree_ITS <- read_tree(
+  "ITS1_emys_rootedTree_newick.tree"
+)
+
+ps_ITS <- merge_phyloseq(metadata_ITS, biom_ITS, tree_ITS)
+
+ps_ITS
+
+```
+
+```{r}
+
+# 2) Basic cleanup
+
+if (!is.null(tax_table(ps_ITS, errorIfNULL = FALSE))) {
+  if (ncol(tax_table(ps_ITS)) == 8) {
+    colnames(tax_table(ps_ITS)) <- c(
+      "Domain", "Phylum", "Class", "Order",
+      "Family", "Genus", "Species", "Subspecies"
+    )
+  }
+}
+
+taxa_names(ps_ITS) <- paste0("ASV_ITS_", seq_len(ntaxa(ps_ITS)))
+
+cat("Initial dataset:\n")
+cat("Samples:", nsamples(ps_ITS), "\n")
+cat("Taxa:", ntaxa(ps_ITS), "\n")
+
+sample_sums_df_ITS <- data.frame(seq_depth = sample_sums(ps_ITS))
+
+summary(sample_sums_df_ITS$seq_depth)
+
+ggplot(sample_sums_df_ITS, aes(x = seq_depth)) +
+  geom_histogram(bins = 30, fill = "grey70", colour = "black") +
+  theme_classic() +
+  labs(
+    title = "Initial ITS sequencing depth",
+    x = "Read counts",
+    y = "Frequency"
+  )
+
+```
+
+```{r}
+
+# 3) Remove non-fungal / unwanted taxa
+
+
+ps_ITS_taxclean <- subset_taxa(
+  ps_ITS,
+  (is.na(Domain) | Domain %in% c("k__Fungi", "Fungi")) &
+    !is.na(Phylum) &
+    (is.na(Family) | !grepl("Mitochondria", Family, ignore.case = TRUE)) &
+    (is.na(Class)  | !grepl("Chloroplast",  Class,  ignore.case = TRUE)) &
+    (is.na(Order)  | !grepl("Chloroplast",  Order,  ignore.case = TRUE))
+)
+
+cat("After fungal taxonomy cleaning:\n")
+cat("Samples:", nsamples(ps_ITS_taxclean), "\n")
+cat("Taxa:", ntaxa(ps_ITS_taxclean), "\n")
+
+```
+
+```{r}
+
+# 4) Define negative controls for decontam
+
+
+sample_data(ps_ITS_taxclean)$control_status <- factor(
+  sample_data(ps_ITS_taxclean)$sample_type %in% c("PCR_blank", "Ext_blank", "ext_blank", "ex_blank"),
+  levels = c(FALSE, TRUE),
+  labels = c("sample", "control")
+)
+
+sample_data(ps_ITS_taxclean)$is_neg <- sample_data(ps_ITS_taxclean)$control_status == "control"
+
+table(sample_data(ps_ITS_taxclean)$control_status, useNA = "ifany")
+table(sample_data(ps_ITS_taxclean)$sample_type, useNA = "ifany")
+
+```
+
+```{r}
+
+# 5) Decontam (prevalence method)
+
+
+if (sum(sample_data(ps_ITS_taxclean)$is_neg, na.rm = TRUE) > 0) {
+
+  contam_prev_ITS <- isContaminant(
+    ps_ITS_taxclean,
+    method = "prevalence",
+    neg = "is_neg",
+    threshold = 0.1
+  )
+
+  cat("Contaminants identified:\n")
+  print(table(contam_prev_ITS$contaminant))
+
+  ps_ITS_noncontam <- prune_taxa(!contam_prev_ITS$contaminant, ps_ITS_taxclean)
+
+} else {
+  warning("No negative controls detected for decontam; continuing without contaminant filtering.")
+  ps_ITS_noncontam <- ps_ITS_taxclean
+}
+
+cat("After decontam:\n")
+cat("Samples:", nsamples(ps_ITS_noncontam), "\n")
+cat("Taxa:", ntaxa(ps_ITS_noncontam), "\n")
+
+```
+
+```{r}
+
+# 6) Restrict to 2024 nest vs environmental control samples
+
+
+ps_ITS_2024_nc <- subset_samples(
+  ps_ITS_noncontam,
+  sample_type %in% c("nest", "control_env")
+)
+
+ps_ITS_2024_nc <- prune_taxa(taxa_sums(ps_ITS_2024_nc) > 0, ps_ITS_2024_nc)
+
+sample_data(ps_ITS_2024_nc)$sample_type <- trimws(as.character(sample_data(ps_ITS_2024_nc)$sample_type))
+sample_data(ps_ITS_2024_nc)$sample_type <- tolower(sample_data(ps_ITS_2024_nc)$sample_type)
+sample_data(ps_ITS_2024_nc)$sample_type <- dplyr::recode(
+  sample_data(ps_ITS_2024_nc)$sample_type,
+  "control_env" = "control"
+)
+
+sample_data(ps_ITS_2024_nc)$sample_type <- factor(
+  sample_data(ps_ITS_2024_nc)$sample_type,
+  levels = c("control", "nest")
+)
+
+cat("2024 nest/control subset:\n")
+cat("Samples:", nsamples(ps_ITS_2024_nc), "\n")
+cat("Taxa:", ntaxa(ps_ITS_2024_nc), "\n")
+print(table(sample_data(ps_ITS_2024_nc)$sample_type))
+print(table(sample_data(ps_ITS_2024_nc)$nesting_site))
+
+
+```
+
+```{r}
+
+# 7) Sequencing depth QC and filtering
+
+
+sample_data(ps_ITS_2024_nc)$Seq_depth <- sample_sums(ps_ITS_2024_nc)
+
+depth_df_ITS <- data.frame(sample_data(ps_ITS_2024_nc))
+
+ggplot(depth_df_ITS, aes(x = Seq_depth, fill = sample_type)) +
+  geom_histogram(bins = 25, colour = "black", alpha = 0.8) +
+  facet_wrap(~ sample_type, scales = "free_y") +
+  theme_classic() +
+  labs(
+    title = "ITS sequencing depth by sample type",
+    x = "Read counts",
+    y = "Frequency"
+  )
+
+summary(sample_sums(ps_ITS_2024_nc))
+
+min_depth_ITS <- 1000
+
+ps_ITS_final <- subset_samples(ps_ITS_2024_nc, sample_sums(ps_ITS_2024_nc) >= min_depth_ITS)
+ps_ITS_final <- prune_taxa(taxa_sums(ps_ITS_final) > 0, ps_ITS_final)
+
+sample_data(ps_ITS_final)$sample_type <- factor(
+  tolower(trimws(as.character(sample_data(ps_ITS_final)$sample_type))),
+  levels = c("control", "nest")
+)
+
+non_target_samples_ITS <- c(
+  "N-HW1-ITS", "N-HW2-ITS", "N-HW3-ITS", "N-HW4-ITS",
+  "N-L1-ITS", "N-L2-ITS", "N-L3-ITS", "N-L4-ITS",
+  "N-CX-ITS"
+)
+
+ps_ITS_final <- prune_samples(
+  !(sample_names(ps_ITS_final) %in% non_target_samples_ITS),
+  ps_ITS_final
+)
+
+ps_ITS_final <- prune_taxa(taxa_sums(ps_ITS_final) > 0, ps_ITS_final)
+
+depths_ITS <- sample_sums(ps_ITS_final)
+cat("After depth filtering and manual exclusion:\n")
+cat("Samples:", nsamples(ps_ITS_final), "\n")
+cat("Taxa:", ntaxa(ps_ITS_final), "\n")
+cat(
+  "Final ITS dataset contains", nsamples(ps_ITS_final),
+  "samples with mean sequencing depth of", round(mean(depths_ITS)),
+  "reads (±", round(sd(depths_ITS)), "SD; range:", min(depths_ITS), "-", max(depths_ITS), ").\n"
+)
+
+```
+
+```{r}
+
+# 8) Plot style
+
+
+pal_main_ITS <- c(
+  "control" = "#053B45",
+  "nest"    = "#B8AA50"
+)
+
+theme_pub_ITS <- theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 17, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "right",
+    legend.title = element_blank(),
+    axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    text = element_text(colour = "black", size = 13),
+    axis.text = element_text(colour = "black", size = 11),
+    axis.title = element_text(size = 13, face = "bold"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+```{r}
+
+# 9) Alpha diversity
+
+
+
+alpha_est_ITS <- estimate_richness(
+  ps_ITS_final,
+  measures = c("Observed", "Chao1", "Shannon")
+)
+
+alpha_est_ITS$sample_name <- sample_names(ps_ITS_final)
+
+meta_alpha_ITS <- data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE)
+meta_alpha_ITS$sample_name <- sample_names(ps_ITS_final)
+meta_alpha_ITS$Seq_depth <- sample_sums(ps_ITS_final)
+
+has_tree_ITS <- !is.null(phy_tree(ps_ITS_final, errorIfNULL = FALSE))
+
+if (has_tree_ITS) {
+  otu_mat_alpha_ITS <- as(otu_table(ps_ITS_final), "matrix")
+  if (taxa_are_rows(ps_ITS_final)) {
+    otu_mat_alpha_ITS <- t(otu_mat_alpha_ITS)
+  }
+
+  faith_pd_ITS <- pd(otu_mat_alpha_ITS, phy_tree(ps_ITS_final), include.root = TRUE)
+
+  faith_pd_df_ITS <- data.frame(
+    sample_name = rownames(faith_pd_ITS),
+    Faith_PD = faith_pd_ITS$PD,
+    stringsAsFactors = FALSE
+  )
+
+  alpha_df_ITS <- alpha_est_ITS %>%
+    left_join(meta_alpha_ITS, by = "sample_name") %>%
+    left_join(faith_pd_df_ITS, by = "sample_name")
+
+  alpha_metrics_ITS <- c("Observed", "Chao1", "Shannon", "Faith_PD")
+
+} else {
+  warning("No phylogenetic tree detected; Faith's PD will be omitted.")
+
+  alpha_df_ITS <- alpha_est_ITS %>%
+    left_join(meta_alpha_ITS, by = "sample_name")
+
+  alpha_metrics_ITS <- c("Observed", "Chao1", "Shannon")
+}
+
+alpha_df_ITS$sample_type <- factor(
+  trimws(tolower(as.character(alpha_df_ITS$sample_type))),
+  levels = c("control", "nest")
+)
+
+dplyr::count(alpha_df_ITS, sample_type)
+
+alpha_df_ITS %>%
+  dplyr::group_by(sample_type) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    Observed_median = median(Observed, na.rm = TRUE),
+    Chao1_median = median(Chao1, na.rm = TRUE),
+    Shannon_median = median(Shannon, na.rm = TRUE),
+    FaithPD_median = if ("Faith_PD" %in% names(cur_data())) median(Faith_PD, na.rm = TRUE) else NA_real_
+  )
+
+```
+
+```{r}
+
+# 10) Alpha diversity statistics
+# site-adjusted main models
+
+
+table(alpha_df_ITS$nesting_site, alpha_df_ITS$sample_type)
+length(unique(alpha_df_ITS$nesting_site))
+
+alpha_results_ITS <- purrr::map_dfr(alpha_metrics_ITS, function(v) {
+
+  dat_sub <- alpha_df_ITS %>%
+    dplyr::select(sample_type, nesting_site, Seq_depth, dplyr::all_of(v)) %>%
+    tidyr::drop_na()
+
+  fit <- lm(
+    as.formula(paste0("log1p(", v, ") ~ sample_type + log1p(Seq_depth) + nesting_site")),
+    data = dat_sub
+  )
+
+  broom::tidy(fit) %>%
+    dplyr::filter(term == "sample_typenest") %>%
+    dplyr::mutate(
+      metric = v,
+      median_control = median(dat_sub[[v]][dat_sub$sample_type == "control"], na.rm = TRUE),
+      median_nest = median(dat_sub[[v]][dat_sub$sample_type == "nest"], na.rm = TRUE)
+    )
+})
+
+alpha_results_ITS <- alpha_results_ITS %>%
+  dplyr::mutate(
+    p_adj_bh = p.adjust(p.value, method = "BH"),
+    direction = dplyr::case_when(
+      estimate > 0 ~ "higher_in_nest",
+      estimate < 0 ~ "lower_in_nest",
+      TRUE ~ "no_difference"
+    )
+  ) %>%
+  dplyr::arrange(p.value)
+
+alpha_results_ITS
+
+```
+
+```{r}
+
+
+# 11) Alpha diversity plots
+
+
+plot_alpha_metric_ITS <- function(dat, metric, ylab_text, title_text = metric) {
+  ggplot(dat, aes(x = sample_type, y = .data[[metric]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main_ITS) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.14))) +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = ylab_text
+    ) +
+    theme_pub_ITS +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12.5, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 11)
+    )
+}
+
+p_obs_ITS   <- plot_alpha_metric_ITS(alpha_df_ITS, "Observed", "Observed richness")
+p_chao1_ITS <- plot_alpha_metric_ITS(alpha_df_ITS, "Chao1", "Chao1")
+p_shan_ITS  <- plot_alpha_metric_ITS(alpha_df_ITS, "Shannon", "Shannon")
+
+alpha_plot_list_ITS <- list(p_obs_ITS, p_chao1_ITS, p_shan_ITS)
+
+if ("Faith_PD" %in% alpha_metrics_ITS) {
+  p_faith_ITS <- plot_alpha_metric_ITS(
+    alpha_df_ITS,
+    "Faith_PD",
+    "Faith's PD",
+    title_text = "Faith's PD"
+  )
+  alpha_plot_list_ITS <- c(alpha_plot_list_ITS, list(p_faith_ITS))
+}
+
+p_alpha_ITS <- wrap_plots(alpha_plot_list_ITS, ncol = 2)
+
+p_alpha_ITS
+
+```
+
+```{r}
+
+# 12) Rarefaction for beta diversity
+
+set.seed(456)
+
+rarefaction_depth_ITS <- min(sample_sums(ps_ITS_final))
+
+ps_ITS_beta_ra <- rarefy_even_depth(
+  ps_ITS_final,
+  sample.size = rarefaction_depth_ITS,
+  rngseed = 456,
+  replace = FALSE,
+  verbose = TRUE
+)
+
+cat("\nRarefied dataset:\n")
+cat("Rarefaction depth:", rarefaction_depth_ITS, "\n")
+cat("Samples:", nsamples(ps_ITS_beta_ra), "\n")
+cat("Taxa:", ntaxa(ps_ITS_beta_ra), "\n")
+print(summary(sample_sums(ps_ITS_beta_ra)))
+
+```
+
+```{r}
+
+# 13) Metadata for beta analyses
+
+
+meta_beta_ITS <- data.frame(sample_data(ps_ITS_beta_ra), stringsAsFactors = FALSE)
+meta_beta_ITS$sample_name <- sample_names(ps_ITS_beta_ra)
+
+meta_beta_ITS$sample_type <- factor(
+  trimws(tolower(as.character(meta_beta_ITS$sample_type))),
+  levels = c("control", "nest")
+)
+
+table(meta_beta_ITS$sample_type, useNA = "ifany")
+table(meta_beta_ITS$nesting_site, meta_beta_ITS$sample_type)
+
+
+
+# 14) Distance matrices
+
+dist_jacc_ITS <- phyloseq::distance(ps_ITS_beta_ra, method = "jaccard")
+dist_uni_ITS  <- phyloseq::distance(ps_ITS_beta_ra, method = "unifrac")
+dist_wuni_ITS <- phyloseq::distance(ps_ITS_beta_ra, method = "wunifrac")
+dist_bray_ITS <- phyloseq::distance(ps_ITS_beta_ra, method = "bray")
+
+
+# 15) Ordinations
+
+ord_jacc_ITS <- ordinate(ps_ITS_beta_ra, method = "PCoA", distance = dist_jacc_ITS)
+ord_uni_ITS  <- ordinate(ps_ITS_beta_ra, method = "PCoA", distance = dist_uni_ITS)
+ord_wuni_ITS <- ordinate(ps_ITS_beta_ra, method = "PCoA", distance = dist_wuni_ITS)
+ord_bray_ITS <- ordinate(ps_ITS_beta_ra, method = "PCoA", distance = dist_bray_ITS)
+
+
+# 16) Beta diversity statistics
+# main models: nesting_site + sample_type
+
+adonis_jacc_ITS <- adonis2(
+  dist_jacc_ITS ~ nesting_site + sample_type,
+  data = meta_beta_ITS,
+  permutations = 999,
+  by = "margin"
+)
+
+adonis_uni_ITS <- adonis2(
+  dist_uni_ITS ~ nesting_site + sample_type,
+  data = meta_beta_ITS,
+  permutations = 999,
+  by = "margin"
+)
+
+adonis_wuni_ITS <- adonis2(
+  dist_wuni_ITS ~ nesting_site + sample_type,
+  data = meta_beta_ITS,
+  permutations = 999,
+  by = "margin"
+)
+
+adonis_bray_ITS <- adonis2(
+  dist_bray_ITS ~ nesting_site + sample_type,
+  data = meta_beta_ITS,
+  permutations = 999,
+  by = "margin"
+)
+
+disp_jacc_ITS <- betadisper(dist_jacc_ITS, group = meta_beta_ITS$sample_type)
+disp_uni_ITS  <- betadisper(dist_uni_ITS,  group = meta_beta_ITS$sample_type)
+disp_wuni_ITS <- betadisper(dist_wuni_ITS, group = meta_beta_ITS$sample_type)
+disp_bray_ITS <- betadisper(dist_bray_ITS, group = meta_beta_ITS$sample_type)
+
+disp_jacc_test_ITS <- permutest(disp_jacc_ITS, permutations = 999)
+disp_uni_test_ITS  <- permutest(disp_uni_ITS,  permutations = 999)
+disp_wuni_test_ITS <- permutest(disp_wuni_ITS, permutations = 999)
+disp_bray_test_ITS <- permutest(disp_bray_ITS, permutations = 999)
+
+adonis_jacc_ITS
+adonis_uni_ITS
+adonis_wuni_ITS
+adonis_bray_ITS
+
+disp_jacc_test_ITS
+disp_uni_test_ITS
+disp_wuni_test_ITS
+disp_bray_test_ITS
+```
+
+```{r}
+
+# 17) Beta diversity plots
+
+extract_scores_ITS <- function(ord_obj, meta_df) {
+  scr <- as.data.frame(ord_obj$vectors[, 1:2])
+  scr <- tibble::rownames_to_column(scr, "sample_name")
+  colnames(scr)[2:3] <- c("Axis1", "Axis2")
+  
+  scr %>%
+    left_join(meta_df, by = "sample_name")
+}
+
+get_axis_percent_ITS <- function(ord_obj, axis = 1) {
+  vals <- ord_obj$values$Relative_eig
+  if (!is.null(vals)) {
+    round(100 * vals[axis], 1)
+  } else {
+    NA_real_
+  }
+}
+
+scores_jacc_ITS <- extract_scores_ITS(ord_jacc_ITS, meta_beta_ITS)
+scores_uni_ITS  <- extract_scores_ITS(ord_uni_ITS,  meta_beta_ITS)
+scores_wuni_ITS <- extract_scores_ITS(ord_wuni_ITS, meta_beta_ITS)
+scores_bray_ITS <- extract_scores_ITS(ord_bray_ITS, meta_beta_ITS)
+
+plot_beta_pub_ITS <- function(score_df, ord_obj, title_text) {
+  
+  var1 <- get_axis_percent_ITS(ord_obj, 1)
+  var2 <- get_axis_percent_ITS(ord_obj, 2)
+  
+  ggplot(score_df, aes(x = Axis1, y = Axis2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm"
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main_ITS) +
+    labs(
+      title = title_text,
+      x = paste0("PCoA1 (", var1, "%)"),
+      y = paste0("PCoA2 (", var2, "%)")
+    ) +
+    theme_pub_ITS +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal"
+    )
+}
+
+p_jacc_ITS <- plot_beta_pub_ITS(scores_jacc_ITS, ord_jacc_ITS, "Jaccard")
+p_uni_ITS  <- plot_beta_pub_ITS(scores_uni_ITS,  ord_uni_ITS,  "Unweighted UniFrac")
+p_wuni_ITS <- plot_beta_pub_ITS(scores_wuni_ITS, ord_wuni_ITS, "Weighted UniFrac")
+p_bray_ITS <- plot_beta_pub_ITS(scores_bray_ITS, ord_bray_ITS, "Bray-Curtis")
+
+p_beta_ITS <- p_jacc_ITS + p_uni_ITS + p_wuni_ITS + p_bray_ITS + plot_layout(ncol = 2, guides = "collect")
+
+p_beta_ITS
+
+```
+
+```{r}
+
+# 17B) Compositional beta diversity: Aitchison / CLR
+# non-rarefied data, site-adjusted
+
+meta_clr_ITS <- data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE)
+meta_clr_ITS$sample_name <- sample_names(ps_ITS_final)
+
+meta_clr_ITS$sample_type <- factor(
+  trimws(tolower(as.character(meta_clr_ITS$sample_type))),
+  levels = c("control", "nest")
+)
+
+meta_clr_ITS$nesting_site <- factor(meta_clr_ITS$nesting_site)
+
+otu_clr_ITS <- as(otu_table(ps_ITS_final), "matrix")
+if (taxa_are_rows(ps_ITS_final)) {
+  otu_clr_ITS <- t(otu_clr_ITS)
+}
+
+otu_clr_ITS <- otu_clr_ITS[, colSums(otu_clr_ITS) > 0, drop = FALSE]
+
+pseudocount_ITS <- 1
+otu_clr_pc_ITS <- otu_clr_ITS + pseudocount_ITS
+
+clr_transform_ITS <- function(x) {
+  log_x <- log(x)
+  log_x - mean(log_x)
+}
+
+otu_clr_mat_ITS <- t(apply(otu_clr_pc_ITS, 1, clr_transform_ITS))
+
+dist_aitch_ITS <- dist(otu_clr_mat_ITS, method = "euclidean")
+
+pca_aitch_ITS <- prcomp(otu_clr_mat_ITS, center = TRUE, scale. = FALSE)
+
+scores_aitch_ITS <- as.data.frame(pca_aitch_ITS$x[, 1:2]) %>%
+  rownames_to_column("sample_name") %>%
+  left_join(meta_clr_ITS, by = "sample_name")
+
+var_expl_aitch_ITS <- summary(pca_aitch_ITS)$importance[2, 1:2] * 100
+
+adonis_aitch_ITS <- adonis2(
+  dist_aitch_ITS ~ nesting_site + sample_type,
+  data = meta_clr_ITS,
+  permutations = 999,
+  by = "margin"
+)
+
+disp_aitch_ITS <- betadisper(dist_aitch_ITS, group = meta_clr_ITS$sample_type)
+disp_aitch_test_ITS <- permutest(disp_aitch_ITS, permutations = 999)
+
+adonis_aitch_block_ITS <- {
+  perm_block_ITS <- how(nperm = 999)
+  setBlocks(perm_block_ITS) <- meta_clr_ITS$nesting_site
+  adonis2(
+    dist_aitch_ITS ~ sample_type,
+    data = meta_clr_ITS,
+    permutations = perm_block_ITS
+  )
+}
+
+adonis_aitch_ITS
+disp_aitch_test_ITS
+adonis_aitch_block_ITS
+
+p_aitch_ITS <- ggplot(scores_aitch_ITS, aes(x = PC1, y = PC2)) +
+  stat_ellipse(
+    aes(colour = sample_type),
+    geom = "path",
+    linewidth = 1.2,
+    type = "norm"
+  ) +
+  geom_point(
+    aes(colour = sample_type),
+    size = 5.2,
+    alpha = 0.70
+  ) +
+  scale_colour_manual(values = pal_main_ITS) +
+  labs(
+    title = "Aitchison (CLR) beta diversity",
+    x = paste0("PC1 (", round(var_expl_aitch_ITS[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_expl_aitch_ITS[2], 1), "%)")
+  ) +
+  theme_pub_ITS +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal"
+  )
+
+p_aitch_ITS
+
+aitch_table_out_ITS <- tibble(
+  distance = "Aitchison_CLR",
+  site_r2 = adonis_aitch_ITS$R2[1],
+  site_f = adonis_aitch_ITS$F[1],
+  site_p = adonis_aitch_ITS$`Pr(>F)`[1],
+  sample_type_r2 = adonis_aitch_ITS$R2[2],
+  sample_type_f = adonis_aitch_ITS$F[2],
+  sample_type_p = adonis_aitch_ITS$`Pr(>F)`[2],
+  dispersion_f = disp_aitch_test_ITS$tab[1, "F"],
+  dispersion_p = disp_aitch_test_ITS$tab[1, "Pr(>F)"],
+  blocked_sample_type_r2 = adonis_aitch_block_ITS$R2[1],
+  blocked_sample_type_f = adonis_aitch_block_ITS$F[1],
+  blocked_sample_type_p = adonis_aitch_block_ITS$`Pr(>F)`[1]
+)
+
+write_csv(
+  aitch_table_out_ITS,
+  "Table_ITS_beta_aitchison_2024.csv"
+)
+
+```
+
+```{r}
+
+# 18) Save result tables
+
+alpha_table_out_ITS <- alpha_results_ITS %>%
+  dplyr::select(
+    metric, estimate, std.error, statistic,
+    p.value, p_adj_bh, median_control, median_nest, direction
+  )
+
+write_csv(
+  alpha_table_out_ITS,
+  "Table_ITS_alpha_site_adjusted_2024.csv"
+)
+
+beta_table_out_ITS <- tibble(
+  distance = c("Jaccard", "Unweighted UniFrac", "Weighted UniFrac", "Bray-Curtis"),
+  site_r2 = c(
+    adonis_jacc_ITS$R2[1],
+    adonis_uni_ITS$R2[1],
+    adonis_wuni_ITS$R2[1],
+    adonis_bray_ITS$R2[1]
+  ),
+  site_f = c(
+    adonis_jacc_ITS$F[1],
+    adonis_uni_ITS$F[1],
+    adonis_wuni_ITS$F[1],
+    adonis_bray_ITS$F[1]
+  ),
+  site_p = c(
+    adonis_jacc_ITS$`Pr(>F)`[1],
+    adonis_uni_ITS$`Pr(>F)`[1],
+    adonis_wuni_ITS$`Pr(>F)`[1],
+    adonis_bray_ITS$`Pr(>F)`[1]
+  ),
+  sample_type_r2 = c(
+    adonis_jacc_ITS$R2[2],
+    adonis_uni_ITS$R2[2],
+    adonis_wuni_ITS$R2[2],
+    adonis_bray_ITS$R2[2]
+  ),
+  sample_type_f = c(
+    adonis_jacc_ITS$F[2],
+    adonis_uni_ITS$F[2],
+    adonis_wuni_ITS$F[2],
+    adonis_bray_ITS$F[2]
+  ),
+  sample_type_p = c(
+    adonis_jacc_ITS$`Pr(>F)`[2],
+    adonis_uni_ITS$`Pr(>F)`[2],
+    adonis_wuni_ITS$`Pr(>F)`[2],
+    adonis_bray_ITS$`Pr(>F)`[2]
+  ),
+  dispersion_f = c(
+    disp_jacc_test_ITS$tab[1, "F"],
+    disp_uni_test_ITS$tab[1, "F"],
+    disp_wuni_test_ITS$tab[1, "F"],
+    disp_bray_test_ITS$tab[1, "F"]
+  ),
+  dispersion_p = c(
+    disp_jacc_test_ITS$tab[1, "Pr(>F)"],
+    disp_uni_test_ITS$tab[1, "Pr(>F)"],
+    disp_wuni_test_ITS$tab[1, "Pr(>F)"],
+    disp_bray_test_ITS$tab[1, "Pr(>F)"]
+  )
+)
+
+beta_table_out_ITS
+
+write_csv(
+  beta_table_out_ITS,
+  "Table_ITS_beta_site_and_sampletype_2024.csv"
+)
+```
+
+```{r}
+
+# 19) Sensitivity analyses for nesting_site
+# Bray-Curtis example
+
+adonis_site_only_ITS <- adonis2(
+  dist_bray_ITS ~ nesting_site,
+  data = meta_beta_ITS,
+  permutations = 999
+)
+
+adonis_sample_only_ITS <- adonis2(
+  dist_bray_ITS ~ sample_type,
+  data = meta_beta_ITS,
+  permutations = 999
+)
+
+adonis_bray_block_ITS <- {
+  perm_block_ITS <- how(nperm = 999)
+  setBlocks(perm_block_ITS) <- meta_beta_ITS$nesting_site
+  adonis2(
+    dist_bray_ITS ~ sample_type,
+    data = meta_beta_ITS,
+    permutations = perm_block_ITS
+  )
+}
+
+adonis_site_only_ITS
+adonis_sample_only_ITS
+adonis_bray_block_ITS
+adonis_bray_ITS
+```
+
+```{r}
+
+# 20) Compact reporting output
+
+cat("\n============================================================\n")
+cat("2024 only | ITS | nest vs control\n")
+cat("============================================================\n")
+
+cat("\nSample sizes:\n")
+print(table(sample_data(ps_ITS_final)$sample_type))
+
+cat("\nAlpha diversity results:\n")
+print(alpha_table_out_ITS)
+
+cat("\nBeta diversity results:\n")
+print(beta_table_out_ITS)
+
+cat("\nBray-Curtis sensitivity analyses:\n")
+cat("\nSite only:\n")
+print(adonis_site_only_ITS)
+
+cat("\nSample type only:\n")
+print(adonis_sample_only_ITS)
+
+cat("\nSample type with site as block:\n")
+print(adonis_bray_block_ITS)
+
+cat("\nSample type after accounting for site (main model):\n")
+print(adonis_bray_ITS)
+```
+
+```{r}
+
+# Shared settings for 16S and ITS differential abundance plots
+
+
+sig_levels_DA <- c(
+  "Robust after BH correction",
+  "BH-corrected only",
+  "Nominal only"
+)
+
+sig_cols_DA <- c(
+  "Robust after BH correction" = "#EE2F5C",
+  "BH-corrected only"          = "#5F2D85",
+  "Nominal only"               = "#D5BBC4"
+)
+```
+
+
+```{r}
+
+# ITS Differential abundance analysis: ANCOM-BC2 genus level
+# Nest vs control, adjusted for nesting site
+# Run on NON-rarefied data: ps_ITS_final
+
+
+library(phyloseq)
+library(ANCOMBC)
+library(tidyverse)
+library(stringr)
+
+set.seed(456)
+
+# 1) Prepare ITS genus-level phyloseq object
+
+ps_genus_ITS <- tax_glom(ps_ITS_final, taxrank = "Genus", NArm = FALSE)
+
+sample_data(ps_genus_ITS)$sample_type <- factor(
+  trimws(tolower(as.character(sample_data(ps_genus_ITS)$sample_type))),
+  levels = c("control", "nest")
+)
+
+sample_data(ps_genus_ITS)$nesting_site <- factor(sample_data(ps_genus_ITS)$nesting_site)
+
+cat("Genus-level ITS dataset:\n")
+cat("Samples:", nsamples(ps_genus_ITS), "\n")
+cat("Taxa:", ntaxa(ps_genus_ITS), "\n")
+
+
+# 2) Run conservative ANCOM-BC2
+
+out_ancom2_genus_ITS <- ancombc2(
+  data = ps_genus_ITS,
+  tax_level = "Genus",
+  assay_name = "counts",
+  fix_formula = "sample_type + nesting_site",
+  rand_formula = NULL,
+  p_adj_method = "BH",
+  pseudo_sens = TRUE,
+  prv_cut = 0.10,
+  lib_cut = 1000,
+  s0_perc = 0.05,
+  group = "sample_type",
+  struc_zero = TRUE,
+  neg_lb = TRUE,
+  alpha = 0.05,
+  n_cl = 1,
+  verbose = TRUE,
+  global = FALSE,
+  pairwise = FALSE,
+  dunnet = FALSE,
+  trend = FALSE
+)
+
+
+# 3) Clean and classify ITS ANCOM-BC2 results
+
+
+res_genus_ITS <- out_ancom2_genus_ITS$res %>%
+  as_tibble() %>%
+  mutate(
+    genus = taxon,
+    genus = str_remove(genus, "^g__"),
+    genus = str_remove(genus, "^D_5__"),
+    genus = str_trim(genus),
+    
+    clean_genus = !str_detect(
+      genus,
+      regex(
+        "D_0__|D_1__|D_2__|D_3__|D_4__|D_5__|uncultured|unidentified|metagenome|Ambiguous_taxa|ASV_|environmental sample|Incertae_sedis|Incertae sedis",
+        ignore_case = TRUE
+      )
+    ),
+    
+    enrichment = case_when(
+      lfc_sample_typenest > 0 ~ "enriched_in_nest",
+      lfc_sample_typenest < 0 ~ "enriched_in_control",
+      TRUE ~ "no_change"
+    ),
+    
+    significance = case_when(
+      q_sample_typenest < 0.05 & diff_robust_sample_typenest == TRUE  ~ "Robust after BH correction",
+      q_sample_typenest < 0.05 & diff_robust_sample_typenest == FALSE ~ "BH-corrected only",
+      TRUE ~ "Nominal only"
+    ),
+    significance = factor(significance, levels = sig_levels_DA)
+  )
+
+
+# 4) Export ITS result tables
+
+
+ancom_table_all_ITS <- res_genus_ITS %>%
+  select(
+    taxon,
+    genus,
+    clean_genus,
+    lfc_sample_typenest,
+    se_sample_typenest,
+    W_sample_typenest,
+    p_sample_typenest,
+    q_sample_typenest,
+    passed_ss_sample_typenest,
+    diff_sample_typenest,
+    diff_robust_sample_typenest,
+    significance,
+    enrichment
+  ) %>%
+  arrange(q_sample_typenest, p_sample_typenest)
+
+ancom_table_robust_ITS <- ancom_table_all_ITS %>%
+  filter(
+    q_sample_typenest < 0.05,
+    diff_robust_sample_typenest == TRUE
+  ) %>%
+  arrange(q_sample_typenest, desc(lfc_sample_typenest))
+
+ancom_table_nominal_clean_ITS <- ancom_table_all_ITS %>%
+  filter(
+    p_sample_typenest < 0.05,
+    clean_genus
+  ) %>%
+  arrange(p_sample_typenest, desc(lfc_sample_typenest))
+
+final_ancom_table_ITS <- ancom_table_robust_ITS %>%
+  transmute(
+    genus,
+    log_fold_change = round(lfc_sample_typenest, 2),
+    se = round(se_sample_typenest, 2),
+    W = round(W_sample_typenest, 2),
+    p_value = signif(p_sample_typenest, 3),
+    q_value = signif(q_sample_typenest, 3),
+    significance,
+    enrichment
+  )
+
+write_csv(ancom_table_all_ITS, "Table_ITS_ANCOMBC2_genus_all_cleaned.csv")
+write_csv(ancom_table_robust_ITS, "Table_ITS_ANCOMBC2_genus_robust_BH.csv")
+write_csv(ancom_table_nominal_clean_ITS, "Table_ITS_ANCOMBC2_genus_nominal_clean_for_plot.csv")
+write_csv(final_ancom_table_ITS, "Table_ITS_ANCOMBC2_genus_final_for_paper.csv")
+
+cat("\nRobust BH-significant fungal genera:\n")
+print(
+  ancom_table_robust_ITS %>%
+    select(genus, lfc_sample_typenest, p_sample_typenest, q_sample_typenest, enrichment),
+  n = Inf
+)
+
+cat("\nClean nominal p < 0.05 fungal genera for plot:\n")
+print(
+  ancom_table_nominal_clean_ITS %>%
+    select(genus, lfc_sample_typenest, p_sample_typenest, q_sample_typenest, significance, enrichment),
+  n = Inf
+)
+
+
+# 5) Build ITS forest plot dataframe
+
+
+plot_da_df_ITS <- res_genus_ITS %>%
+  filter(
+    p_sample_typenest < 0.05,
+    clean_genus
+  ) %>%
+  mutate(
+    ci_low = lfc_sample_typenest - 1.96 * se_sample_typenest,
+    ci_high = lfc_sample_typenest + 1.96 * se_sample_typenest
+  ) %>%
+  arrange(lfc_sample_typenest) %>%
+  mutate(
+    genus = factor(genus, levels = genus),
+    significance = factor(significance, levels = sig_levels_DA)
+  )
+
+# Check what appears in the ITS plot
+plot_da_df_ITS %>%
+  mutate(genus = as.character(genus)) %>%
+  select(
+    genus,
+    lfc_sample_typenest,
+    se_sample_typenest,
+    p_sample_typenest,
+    q_sample_typenest,
+    diff_robust_sample_typenest,
+    significance,
+    enrichment
+  ) %>%
+  print(n = Inf)
+
+
+# 6) ITS forest plot
+
+
+p_da_forest_ITS <- ggplot(
+  plot_da_df_ITS,
+  aes(x = lfc_sample_typenest, y = genus)
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey65",
+    linewidth = 0.7
+  ) +
+  geom_errorbar(
+    aes(xmin = ci_low, xmax = ci_high),
+    orientation = "y",
+    width = 0.14,
+    linewidth = 1.0,
+    colour = "grey55",
+    alpha = 0.9
+  ) +
+  geom_point(
+    aes(fill = significance),
+    shape = 21,
+    size = 5.2,
+    colour = "grey35",
+    stroke = 0.8,
+    alpha = 0.95
+  ) +
+  scale_fill_manual(
+  name = "Differential abundance evidence",
+  values = sig_cols_DA,
+  breaks = sig_levels_DA,
+  limits = sig_levels_DA,
+  drop = FALSE
+) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.08, 0.12))
+  ) +
+  labs(
+    title = "Differentially abundant fungal genera",
+    x = "Log fold change (nest vs control)",
+    y = NULL
+  ) +
+  theme_pub_ITS +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(face = "italic", size = 11),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  ) +
+  guides(
+  fill = guide_legend(
+    order = 2,
+    nrow = 1,
+    byrow = TRUE,
+    override.aes = list(
+      shape = 21,
+      size = 4.8,
+      colour = "grey35",
+      stroke = 0.8,
+      alpha = 1
+    )
+  )
+)
+
+p_da_forest_ITS
+
+
+```
+
+```{r}
+
+# Figure 2: bacterial and fungal community composition
+# plus differential abundance
+# A = bacterial community composition
+# B = bacterial differential abundance
+# C = fungal community composition
+# D = fungal differential abundance
+# One shared legend at the bottom
+
+
+# 1) Ordination panels
+
+p_aitch_A <- p_aitch +
+  scale_colour_manual(
+    name = "Sample type",
+    values = pal_main,
+    breaks = c("control", "nest"),
+    labels = c("Control", "Nest")
+  ) +
+  labs(
+    title = "Bacterial community composition",
+    tag = "A"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  ) +
+  guides(
+    colour = guide_legend(
+      order = 1,
+      nrow = 1,
+      byrow = TRUE,
+      override.aes = list(size = 4.8, alpha = 1)
+    )
+  )
+
+p_aitch_C <- p_aitch_ITS +
+  scale_colour_manual(
+    name = "Sample type",
+    values = pal_main,
+    breaks = c("control", "nest"),
+    labels = c("Control", "Nest")
+  ) +
+  labs(
+    title = "Fungal community composition",
+    tag = "C"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  ) +
+  guides(
+    colour = guide_legend(
+      order = 1,
+      nrow = 1,
+      byrow = TRUE,
+      override.aes = list(size = 4.8, alpha = 1)
+    )
+  )
+
+
+# 2) Forest plot panels
+
+p_forest_B <- p_da_forest_16S +
+  labs(
+    title = "Bacterial taxa shifts",
+    tag = "B"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+p_forest_D <- p_da_forest_ITS +
+  labs(
+    title = "Fungal taxa shifts",
+    tag = "D"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+
+# 3) Build rows
+
+
+p_row_top <- (p_aitch_A | p_forest_B) +
+  plot_layout(widths = c(1.15, 1))
+
+p_row_bottom <- (p_aitch_C | p_forest_D) +
+  plot_layout(widths = c(1.15, 1))
+
+
+# 4) Combined figure with shared bottom legend
+
+p_fig2_combined <- (p_row_top / p_row_bottom) +
+  plot_layout(heights = c(1, 1), guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.direction = "horizontal",
+    legend.box = "vertical",
+    legend.box.just = "center",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_fig2_combined
+
+```
+
+```{r}
+
+# Supplementary-style alpha + beta figure
+common_theme <- theme(
+  axis.title = element_text(size = 12, face = "bold"),
+  plot.title = element_text(size = 12, face = "bold")
+)
+
+p_obs2_ITS <- p_obs_ITS +
+  labs(y = "Fungal diversity") +
+  theme(legend.position = "none") +
+  common_theme
+
+p_chao12_ITS <- p_chao1_ITS +
+  labs(y = "") +
+  theme(legend.position = "none") +
+  common_theme
+
+p_shan2_ITS <- p_shan_ITS +
+  labs(y = "") +
+  theme(legend.position = "none") +
+  common_theme
+
+p_faith2_ITS <- p_faith_ITS +
+  labs(y = "") +
+  theme(legend.position = "none") +
+  common_theme
+
+p_jacc2_ITS <- p_jacc_ITS + common_theme
+p_uni2_ITS  <- p_uni_ITS  + common_theme
+p_wuni2_ITS <- p_wuni_ITS + common_theme
+p_bray2_ITS <- p_bray_ITS + common_theme
+
+p_alpha_row_ITS <- p_obs2_ITS | p_chao12_ITS | p_shan2_ITS | p_faith2_ITS
+
+p_beta_row_ITS <- (p_jacc2_ITS | p_uni2_ITS | p_wuni2_ITS | p_bray2_ITS) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal"
+  )
+
+p_supp_ITS <- p_alpha_row_ITS / p_beta_row_ITS +
+  plot_layout(heights = c(1, 1))
+
+p_supp_ITS
+
+```

@@ -1,0 +1,1050 @@
+---
+title: "1)nutrients"
+---
+
+```{r}
+
+# Packages
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(stringr)
+library(vegan)
+library(effsize)
+library(broom)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(scales)
+
+set.seed(1)
+```
+
+```{r}
+
+# 1) Import and clean
+
+Nutrients_all <- read_excel("Dataset_Nutrients_EmysOrbicularis_Meyer.xlsx")
+
+to_numeric_comma <- function(x) {
+  x <- as.character(x)
+  x <- str_replace_all(x, ",", ".")
+  suppressWarnings(as.numeric(x))
+}
+
+df_2024 <- Nutrients_all %>%
+  clean_names() %>%
+  mutate(across(everything(), ~ ifelse(.x == "NA", NA, .x))) %>%
+  mutate(
+    sample_type  = factor(sample_type),
+    season       = factor(season),
+    nesting_site = factor(nesting_site),
+    landuse      = factor(landuse)
+  )
+
+
+meta_vars <- c(
+  "slbez", "sample_type", "season", "nesting_site", "landuse",
+  "nest_depth", "total_egg_number", "egg_number_hatched",
+  "egg_number_undeveloped", "failure_unknowncause",
+  "dead_embryos_hatchlings_nest", "living_hatchlings_nest",
+  "hatching_rate", "emergence_rate"
+)
+
+meta_vars <- intersect(meta_vars, names(df_2024))
+nutrient_vars_raw <- setdiff(names(df_2024), meta_vars)
+
+df_2024 <- df_2024 %>%
+  mutate(across(all_of(nutrient_vars_raw), to_numeric_comma))
+```
+
+```{r}
+
+# 2) Aggregate fractions to total nutrient variables
+
+
+df_2024 <- df_2024 %>%
+  mutate(
+    p_euf = ifelse(
+      is.na(p1) & is.na(p2),
+      NA,
+      rowSums(across(c(p1, p2)), na.rm = TRUE)
+    ),
+    k_euf = ifelse(
+      is.na(k1) & is.na(k2),
+      NA,
+      rowSums(across(c(k1, k2)), na.rm = TRUE)
+    ),
+    ca_euf = ifelse(
+      is.na(ca1) & is.na(ca2),
+      NA,
+      rowSums(across(c(ca1, ca2)), na.rm = TRUE)
+    ),
+    mg_euf = ifelse(
+      is.na(mg1) & is.na(mg2),
+      NA,
+      rowSums(across(c(mg1, mg2)), na.rm = TRUE)
+    ),
+    bor_euf = ifelse(
+      is.na(bor1) & is.na(bor2),
+      NA,
+      rowSums(across(c(bor1, bor2)), na.rm = TRUE)
+    ),
+    s_icp = ifelse(
+      is.na(s_icp1) & is.na(s_icp2),
+      NA,
+      rowSums(across(c(s_icp1, s_icp2)), na.rm = TRUE)
+    ),
+    p_icp = ifelse(
+      is.na(p_icp1) & is.na(p_icp2),
+      NA,
+      rowSums(across(c(p_icp1, p_icp2)), na.rm = TRUE)
+    )
+  ) %>%
+  mutate(
+    p_total = ifelse(
+      is.na(p_euf) & is.na(p_icp),
+      NA,
+      rowSums(across(c(p_euf, p_icp)), na.rm = TRUE)
+    )
+  )
+```
+
+
+```{r}
+# ============================================================
+# 3) Labels, variable groups, and plot style
+# ============================================================
+
+#pal_main <- c(
+#  "control" = "#074F57",
+#  "nest"    = "#698050"
+#)
+
+
+pal_main <- c(
+  "control" = "#053B45",
+  "nest"    = "#B8AA50"
+)
+
+
+
+theme_pub <- theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 17, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "right",
+    legend.title = element_blank(),
+    axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    text = element_text(colour = "black", size = 13),
+    axis.text = element_text(colour = "black", size = 11),
+    axis.title = element_text(size = 13, face = "bold"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+nutrient_labels <- c(
+  p_total = "Phosphorus",
+  k_euf   = "Potassium",
+  ca_euf  = "Calcium",
+  mg_euf  = "Magnesium",
+  bor_euf = "Boron",
+  na      = "Sodium",
+  s_icp   = "Sulfur",
+  no3_de  = "Nitrate nitrogen",
+  norg_de = "Organic nitrogen",
+  fe3     = "Iron",
+  mn3     = "Manganese",
+  zn3     = "Zinc",
+  cu3     = "Copper"
+)
+
+nutrient_units <- c(
+  p_total = "mg/100g",
+  k_euf   = "mg/100g",
+  ca_euf  = "mg/100g",
+  mg_euf  = "mg/100g",
+  na      = "mg/100g",
+  s_icp   = "mg/100g",
+  no3_de  = "mg/100g",
+  norg_de = "mg/100g",
+  bor_euf = "mg/1000g",
+  fe3     = "mg/1000g",
+  mn3     = "mg/1000g",
+  zn3     = "mg/1000g",
+  cu3     = "mg/1000g"
+)
+
+macro_vars <- c(
+  "p_total",
+  "k_euf",
+  "ca_euf",
+  "mg_euf",
+  "na",
+  "s_icp",
+  "no3_de",
+  "norg_de"
+)
+
+micro_vars <- c(
+  "bor_euf",
+  "fe3",
+  "mn3",
+  "zn3",
+  "cu3"
+)
+
+macro_vars <- intersect(macro_vars, names(df_2024))
+micro_vars <- intersect(micro_vars, names(df_2024))
+
+get_unit_label <- function(var) {
+  if (var %in% micro_vars) {
+    "mg/1000g"
+  } else {
+    "mg/100g"
+  }
+}
+
+
+# Helper: significance stars from p-values
+
+
+p_to_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p <= 0.001 ~ "***",
+    p <= 0.01  ~ "**",
+    p <= 0.05  ~ "*",
+    TRUE ~ ""
+  )
+}
+```
+
+
+```{r}
+
+# 4) Analysis dataset
+
+
+dat_nc <- df_2024 %>%
+  filter(sample_type %in% c("control", "nest")) %>%
+  mutate(sample_type = factor(sample_type, levels = c("control", "nest")))
+
+table(dat_nc$sample_type)
+length(unique(dat_nc$nesting_site))
+```
+
+```{r}
+
+# 5A) Macronutrients: PCA + blocked PERMANOVA + dispersion
+
+
+dat_macro <- dat_nc %>%
+  select(sample_type, nesting_site, all_of(macro_vars))
+
+cc_macro <- complete.cases(dat_macro[, c("sample_type", "nesting_site", macro_vars)])
+dat_macro <- dat_macro[cc_macro, ]
+
+X_macro <- dat_macro %>%
+  select(all_of(macro_vars)) %>%
+  mutate(across(everything(), log1p)) %>%
+  as.matrix()
+
+X_macro <- X_macro[, apply(X_macro, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+macro_used <- colnames(X_macro)
+
+X_macro_scaled <- scale(X_macro)
+
+pca_macro <- prcomp(X_macro_scaled, center = FALSE, scale. = FALSE)
+
+scores_macro <- as.data.frame(pca_macro$x[, 1:2]) %>%
+  rownames_to_column("sample_id") %>%
+  mutate(
+    sample_type = dat_macro$sample_type,
+    nesting_site = dat_macro$nesting_site
+  )
+
+macro_var_expl <- summary(pca_macro)$importance[2, 1:2] * 100
+
+perm_macro <- how(nperm = 999)
+setBlocks(perm_macro) <- dat_macro$nesting_site
+
+dist_macro <- dist(X_macro_scaled, method = "euclidean")
+
+adonis_macro <- adonis2(
+  dist_macro ~ sample_type,
+  data = dat_macro,
+  permutations = perm_macro
+)
+
+disp_macro <- betadisper(dist_macro, group = dat_macro$sample_type)
+disp_macro_test <- permutest(disp_macro, permutations = perm_macro)
+
+adonis_macro
+disp_macro_test
+
+p_macro_pca <- ggplot(scores_macro, aes(x = PC1, y = PC2)) +
+  stat_ellipse(
+    aes(colour = sample_type),
+    geom = "path",
+    linewidth = 1.2,
+    type = "norm"
+  ) +
+  geom_point(
+    aes(colour = sample_type),
+    size = 5.2,
+    alpha = 0.70
+  ) +
+  scale_colour_manual(values = pal_main) +
+  labs(
+    title = "Macronutrients",
+    x = paste0("PC1 (", round(macro_var_expl[1], 1), "%)"),
+    y = paste0("PC2 (", round(macro_var_expl[2], 1), "%)"),
+    tag = "A"
+  ) +
+  theme_pub +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+p_macro_pca
+```
+
+```{r}
+
+# 5B) Micronutrients: PCA + blocked PERMANOVA + dispersion
+
+
+dat_micro <- dat_nc %>%
+  select(sample_type, nesting_site, all_of(micro_vars))
+
+cc_micro <- complete.cases(dat_micro[, c("sample_type", "nesting_site", micro_vars)])
+dat_micro <- dat_micro[cc_micro, ]
+
+X_micro <- dat_micro %>%
+  select(all_of(micro_vars)) %>%
+  mutate(across(everything(), log1p)) %>%
+  as.matrix()
+
+X_micro <- X_micro[, apply(X_micro, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+micro_used <- colnames(X_micro)
+
+X_micro_scaled <- scale(X_micro)
+
+pca_micro <- prcomp(X_micro_scaled, center = FALSE, scale. = FALSE)
+
+scores_micro <- as.data.frame(pca_micro$x[, 1:2]) %>%
+  rownames_to_column("sample_id") %>%
+  mutate(
+    sample_type = dat_micro$sample_type,
+    nesting_site = dat_micro$nesting_site
+  )
+
+micro_var_expl <- summary(pca_micro)$importance[2, 1:2] * 100
+
+perm_micro <- how(nperm = 999)
+setBlocks(perm_micro) <- dat_micro$nesting_site
+
+dist_micro <- dist(X_micro_scaled, method = "euclidean")
+
+adonis_micro <- adonis2(
+  dist_micro ~ sample_type,
+  data = dat_micro,
+  permutations = perm_micro
+)
+
+disp_micro <- betadisper(dist_micro, group = dat_micro$sample_type)
+disp_micro_test <- permutest(disp_micro, permutations = perm_micro)
+
+adonis_micro
+disp_micro_test
+
+p_micro_pca <- ggplot(scores_micro, aes(x = PC1, y = PC2)) +
+  stat_ellipse(
+    aes(colour = sample_type),
+    geom = "path",
+    linewidth = 1.2,
+    type = "norm"
+  ) +
+  geom_point(
+    aes(colour = sample_type),
+    size = 5.2,
+    alpha = 0.70
+  ) +
+  scale_colour_manual(values = pal_main) +
+  labs(
+    title = "Micronutrients",
+    x = paste0("PC1 (", round(micro_var_expl[1], 1), "%)"),
+    y = paste0("PC2 (", round(micro_var_expl[2], 1), "%)"),
+    tag = "C"
+  ) +
+  theme_pub +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+p_micro_pca
+```
+
+```{r}
+
+
+
+
+# 6) Figure 1: PCA panels
+
+
+p_pca_panels <- (p_macro_pca + p_micro_pca) +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.direction = "horizontal"
+  )
+
+p_pca_panels
+
+```
+
+```{r}
+
+# 7A) Macronutrients: site-adjusted exploratory follow-up models
+
+
+results_macro <- map_dfr(macro_used, function(v) {
+  
+  dat_sub <- dat_nc %>%
+    select(sample_type, nesting_site, all_of(v)) %>%
+    drop_na()
+  
+  fit <- lm(
+    as.formula(paste0("log1p(", v, ") ~ sample_type + nesting_site")),
+    data = dat_sub
+  )
+  
+  broom::tidy(fit) %>%
+    filter(term == "sample_typenest") %>%
+    mutate(
+      nutrient = v,
+      nutrient_label = recode(v, !!!nutrient_labels, .default = v),
+      median_control = median(dat_sub[[v]][dat_sub$sample_type == "control"], na.rm = TRUE),
+      median_nest = median(dat_sub[[v]][dat_sub$sample_type == "nest"], na.rm = TRUE)
+    )
+})
+
+results_macro <- results_macro %>%
+  mutate(
+    p_adj_bh = p.adjust(p.value, method = "BH"),
+    direction = case_when(
+      estimate > 0 ~ "higher_in_nest",
+      estimate < 0 ~ "lower_in_nest",
+      TRUE ~ "no_difference"
+    )
+  ) %>%
+  arrange(p.value)
+
+results_macro
+```
+
+```{r}
+
+# 7B) Micronutrients: site-adjusted exploratory follow-up models
+
+
+results_micro <- map_dfr(micro_used, function(v) {
+  
+  dat_sub <- dat_nc %>%
+    select(sample_type, nesting_site, all_of(v)) %>%
+    drop_na()
+  
+  fit <- lm(
+    as.formula(paste0("log1p(", v, ") ~ sample_type + nesting_site")),
+    data = dat_sub
+  )
+  
+  broom::tidy(fit) %>%
+    filter(term == "sample_typenest") %>%
+    mutate(
+      nutrient = v,
+      nutrient_label = recode(v, !!!nutrient_labels, .default = v),
+      median_control = median(dat_sub[[v]][dat_sub$sample_type == "control"], na.rm = TRUE),
+      median_nest = median(dat_sub[[v]][dat_sub$sample_type == "nest"], na.rm = TRUE)
+    )
+})
+
+results_micro <- results_micro %>%
+  mutate(
+    p_adj_bh = p.adjust(p.value, method = "BH"),
+    direction = case_when(
+      estimate > 0 ~ "higher_in_nest",
+      estimate < 0 ~ "lower_in_nest",
+      TRUE ~ "no_difference"
+    )
+  ) %>%
+  arrange(p.value)
+
+results_micro
+```
+
+```{r}
+
+# 8) Figure 2: top nutrients
+# raw concentrations with units
+
+
+top_macro <- results_macro %>%
+  slice_head(n = min(4, nrow(results_macro))) %>%
+  pull(nutrient)
+
+top_micro <- results_micro %>%
+  slice_head(n = min(4, nrow(results_micro))) %>%
+  pull(nutrient)
+
+plot_list_macro <- map(top_macro, function(v) {
+  
+  this_title <- recode(v, !!!nutrient_labels, .default = v)
+  this_unit  <- nutrient_units[[v]]
+  
+  this_p <- results_macro %>%
+    filter(nutrient == v) %>%
+    pull(p_adj_bh)
+  
+  this_star <- p_to_stars(this_p)
+  
+  y_max <- max(dat_nc[[v]], na.rm = TRUE)
+  y_min <- min(dat_nc[[v]], na.rm = TRUE)
+  y_pos <- y_max + 0.08 * (y_max - y_min)
+  
+  ggplot(dat_nc, aes(x = sample_type, y = .data[[v]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_pos,
+      label = this_star,
+      size = 6,
+      fontface = "bold"
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+    labs(
+      title = this_title,
+      x = NULL,
+      y = this_unit
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12.5, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 11)
+    )
+})
+
+plot_list_micro <- map(top_micro, function(v) {
+  
+  this_title <- recode(v, !!!nutrient_labels, .default = v)
+  this_unit  <- nutrient_units[[v]]
+  
+  this_p <- results_micro %>%
+    filter(nutrient == v) %>%
+    pull(p_adj_bh)
+  
+  this_star <- p_to_stars(this_p)
+  
+  y_max <- max(dat_nc[[v]], na.rm = TRUE)
+  y_min <- min(dat_nc[[v]], na.rm = TRUE)
+  y_pos <- y_max + 0.08 * (y_max - y_min)
+  
+  ggplot(dat_nc, aes(x = sample_type, y = .data[[v]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_pos,
+      label = this_star,
+      size = 6,
+      fontface = "bold"
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+    labs(
+      title = this_title,
+      x = NULL,
+      y = this_unit
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12.5, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 11)
+    )
+})
+
+p_top_macro <- wrap_plots(plot_list_macro, ncol = 2)
+p_top_micro <- wrap_plots(plot_list_micro, ncol = 2)
+
+# Die 2x2-Blöcke als je ein Panel behandeln und taggen
+p_top_macro_panel <- wrap_elements(full = p_top_macro) +
+  labs(tag = "B") +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+p_top_micro_panel <- wrap_elements(full = p_top_micro) +
+  labs(tag = "D") +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+p_top_panels <- p_top_macro_panel | p_top_micro_panel
+
+p_top_panels
+
+
+p_final <- p_pca_panels / p_top_panels +
+  plot_layout(heights = c(1.0, 1.25))
+
+p_final
+
+```
+
+```{r}
+
+# 10) Save result tables
+
+
+macro_table_out <- results_macro %>%
+  select(
+    nutrient, nutrient_label, estimate, std.error, statistic,
+    p.value, p_adj_bh, median_control, median_nest, direction
+  )
+
+micro_table_out <- results_micro %>%
+  select(
+    nutrient, nutrient_label, estimate, std.error, statistic,
+    p.value, p_adj_bh, median_control, median_nest, direction
+  )
+
+write_csv(macro_table_out, "Table_macronutrients_site_adjusted_aggregated_2024.csv")
+write_csv(micro_table_out, "Table_micronutrients_site_adjusted_aggregated_2024.csv")
+```
+
+```{r}
+# ============================================================
+# 11) Compact reporting output
+# ============================================================
+
+cat("\n============================================================\n")
+cat("2024 only | nest vs control | aggregated nutrient variables\n")
+cat("============================================================\n")
+
+cat("\nSample sizes:\n")
+print(table(dat_nc$sample_type))
+
+cat("\nMacronutrients: blocked PERMANOVA\n")
+print(adonis_macro)
+
+cat("\nMacronutrients: dispersion test\n")
+print(disp_macro_test)
+
+cat("\nMicronutrients: blocked PERMANOVA\n")
+print(adonis_micro)
+
+cat("\nMicronutrients: dispersion test\n")
+print(disp_micro_test)
+
+cat("\nTop macronutrient follow-up results:\n")
+macro_table_out %>%
+  arrange(p.value) %>%
+  print(n = 20)
+
+cat("\nTop micronutrient follow-up results:\n")
+micro_table_out %>%
+  arrange(p.value) %>%
+  print(n = 20)
+```
+
+```{r}
+loadings <- pca_macro$rotation[,1]
+sort(abs(loadings), decreasing = TRUE)
+
+loadings <- pca_micro$rotation[,1]
+sort(abs(loadings), decreasing = TRUE)
+```
+
+```{r}
+
+# Supplementary figure: all measured nutrients
+
+plot_list_macro_all <- map(macro_vars, function(v) {
+  
+  this_title <- recode(v, !!!nutrient_labels, .default = v)
+  this_unit  <- nutrient_units[[v]]
+  
+  ggplot(dat_nc, aes(x = sample_type, y = .data[[v]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.14))) +
+    labs(
+      title = this_title,
+      x = NULL,
+      y = this_unit
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+})
+
+plot_list_micro_all <- map(micro_vars, function(v) {
+  
+  this_title <- recode(v, !!!nutrient_labels, .default = v)
+  this_unit  <- get_unit_label(v)
+  
+  ggplot(dat_nc, aes(x = sample_type, y = .data[[v]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.14))) +
+    labs(
+      title = this_title,
+      x = NULL,
+      y = this_unit
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+})
+
+p_macro_all <- wrap_plots(plot_list_macro_all, ncol = 3) +
+  plot_annotation(
+    title = "Macronutrients",
+    theme = theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5)
+    )
+  )
+p_macro_all
+
+#Supplementary Fig. 1
+
+p_micro_all <- wrap_plots(plot_list_micro_all, ncol = 3) +
+  plot_annotation(
+    title = "Micronutrients",
+    theme = theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5)
+    )
+  )
+p_micro_all
+
+#Supplementary Fig. 2
+
+p_supplement <- p_macro_all | p_micro_all
+
+p_supplement
+
+
+# Supplementary figure: all measured nutrients
+# Macronutrients above micronutrients
+# BH-adjusted significance stars as in Figure 1
+
+
+get_bh_star <- function(v, results_tbl) {
+  
+  this_p <- results_tbl %>%
+    filter(nutrient == v) %>%
+    pull(p_adj_bh)
+  
+  if (length(this_p) == 0) return("")
+  
+  p_to_stars(this_p[1])
+}
+
+make_section_title <- function(title_text) {
+  ggplot() +
+    annotate(
+      "text",
+      x = 0.5,
+      y = 0.5,
+      label = title_text,
+      fontface = "bold",
+      size = 6
+    ) +
+    xlim(0, 1) +
+    ylim(0, 1) +
+    theme_void()
+}
+
+make_nutrient_plot <- function(v, results_tbl) {
+  
+  this_title <- recode(v, !!!nutrient_labels, .default = v)
+  this_unit  <- nutrient_units[[v]]
+  this_star  <- get_bh_star(v, results_tbl)
+  
+  y_max <- max(dat_nc[[v]], na.rm = TRUE)
+  y_min <- min(dat_nc[[v]], na.rm = TRUE)
+  y_range <- y_max - y_min
+  
+  if (is.na(y_range) || y_range == 0) {
+    y_pos <- y_max * 1.08
+  } else {
+    y_pos <- y_max + 0.08 * y_range
+  }
+  
+  p <- ggplot(dat_nc, aes(x = sample_type, y = .data[[v]], colour = sample_type)) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20))) +
+    labs(
+      title = this_title,
+      x = NULL,
+      y = this_unit
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+  
+  if (this_star != "") {
+    p <- p +
+      annotate(
+        "text",
+        x = 1.5,
+        y = y_pos,
+        label = this_star,
+        size = 6,
+        fontface = "bold"
+      )
+  }
+  
+  p
+}
+
+plot_list_macro_all <- map(macro_vars, function(v) {
+  make_nutrient_plot(v, results_macro)
+})
+
+plot_list_micro_all <- map(micro_vars, function(v) {
+  make_nutrient_plot(v, results_micro)
+})
+
+p_macro_title <- make_section_title("Macronutrients")
+p_micro_title <- make_section_title("Micronutrients")
+
+p_macro_all <- wrap_plots(plot_list_macro_all, ncol = 3)
+p_micro_all <- wrap_plots(plot_list_micro_all, ncol = 3)
+
+p_supplement <- p_macro_title / p_macro_all / p_micro_title / p_micro_all +
+  plot_layout(heights = c(0.12, 1.45, 0.12, 1))
+
+p_supplement
+
+```
+
+```{r}
+
+# Correlation heatmap of macro- and micronutrients
+
+library(tidyverse)
+library(pheatmap)
+library(grid)
+
+
+# 1) Data
+
+
+nutrient_vars <- intersect(c(macro_vars, micro_vars), names(dat_nc))
+
+dat_corr <- dat_nc %>%
+  select(all_of(nutrient_vars)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  drop_na() %>%
+  mutate(across(everything(), log1p))
+
+heat_cols <- colorRampPalette(c(
+  "#224A6D",
+  "#FFFFFF",
+  "#EF436B"
+))(100)
+
+
+# 2) Correlation matrix
+
+
+cor_mat <- cor(dat_corr, method = "spearman", use = "pairwise.complete.obs")
+
+
+# 3) P-value matrix
+
+
+cor_pmat <- matrix(NA_real_, ncol = ncol(dat_corr), nrow = ncol(dat_corr))
+colnames(cor_pmat) <- colnames(dat_corr)
+rownames(cor_pmat) <- colnames(dat_corr)
+
+for (i in seq_len(ncol(dat_corr))) {
+  for (j in seq_len(ncol(dat_corr))) {
+    cor_pmat[i, j] <- suppressWarnings(
+      cor.test(dat_corr[[i]], dat_corr[[j]], method = "spearman", exact = FALSE)$p.value
+    )
+  }
+}
+
+
+# 4) Significance labels
+
+
+sig_labels <- matrix("", nrow = nrow(cor_pmat), ncol = ncol(cor_pmat))
+sig_labels[cor_pmat < 0.05] <- "*"
+sig_labels[cor_pmat < 0.01] <- "**"
+sig_labels[cor_pmat < 0.001] <- "***"
+diag(sig_labels) <- ""
+
+
+# 5) Pretty labels
+
+
+pretty_names <- nutrient_labels[colnames(cor_mat)]
+
+colnames(cor_mat) <- pretty_names
+rownames(cor_mat) <- pretty_names
+colnames(sig_labels) <- pretty_names
+rownames(sig_labels) <- pretty_names
+
+
+# 6) Plot to Viewer / RMarkdown
+
+pheatmap(
+  cor_mat,
+  color = heat_cols,
+  breaks = seq(-1, 1, length.out = 101),
+  border_color = NA,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  display_numbers = sig_labels,
+  number_color = "black",
+  fontsize = 10,
+  fontsize_number = 9,
+  main = "Spearman correlation among soil nutrients"
+)
+
+
+# 7) Save as PDF
+
+pheatmap(
+  cor_mat,
+  color = heat_cols,
+  breaks = seq(-1, 1, length.out = 101),
+  border_color = NA,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  display_numbers = sig_labels,
+  number_color = "black",
+  fontsize = 10,
+  fontsize_number = 9,
+  main = "Spearman correlation among soil nutrients",
+  filename = "Supplementary_Figure_nutrient_correlation_heatmap.pdf",
+  width = 7,
+  height = 6
+)
+
+
+# Save heatmap as PNG for Word
+
+
+pheatmap(
+  cor_mat,
+  color = heat_cols,
+  breaks = seq(-1, 1, length.out = 101),
+  border_color = NA,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  display_numbers = sig_labels,
+  number_color = "black",
+  fontsize = 10,
+  fontsize_number = 9,
+  main = "Spearman correlation among soil nutrients",
+  filename = "Supplementary_Figure_nutrient_correlation_heatmap.png",
+  width = 7,
+  height = 6
+)
+
+```
+

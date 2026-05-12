@@ -1,0 +1,1345 @@
+---
+title: "5)nutrients_meet_ITS"
+---
+
+```{r}
+library(tidyverse)
+library(broom)
+library(vegan)
+library(patchwork)
+library(grid)
+library(phyloseq)
+library(janitor)
+library(ggrepel)
+
+set.seed(123)
+
+# Shared colour palette for all figures
+
+pal_main <- c(
+  "control" = "#053B45",
+  "nest"    = "#B8AA50"
+)
+
+pal_main_ITS <- pal_main
+```
+
+```{r}
+
+required_objects <- c(
+  "dat_nc", "macro_vars", "micro_vars", "nutrient_labels",
+  "pal_main", "theme_pub", "to_numeric_comma", "ps_ITS_final"
+)
+
+missing_objects <- required_objects[!vapply(required_objects, exists, logical(1))]
+
+if (length(missing_objects) > 0) {
+  stop(
+    "The following required objects are missing from the environment: ",
+    paste(missing_objects, collapse = ", "),
+    ". Run the nutrient script and ITS script first."
+  )
+}
+
+```
+
+```{r}
+
+# 1) PCA-based hotspot indices for macro- and micronutrients
+
+
+run_hotspot_index <- function(data, vars, group_label, title_prefix,
+                              min_explained = 0.80) {
+
+  vars <- intersect(vars, names(data))
+
+  dat_index <- data %>%
+    select(sample_type, nesting_site, all_of(vars)) %>%
+    drop_na()
+
+  X_index <- dat_index %>%
+    select(all_of(vars)) %>%
+    mutate(across(everything(), log1p)) %>%
+    as.matrix()
+
+  X_index <- X_index[, apply(X_index, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+  vars_used <- colnames(X_index)
+  X_index_scaled <- scale(X_index)
+
+  pca_index <- prcomp(X_index_scaled, center = FALSE, scale. = FALSE)
+
+  prop_var <- (pca_index$sdev^2) / sum(pca_index$sdev^2)
+  cum_var <- cumsum(prop_var)
+
+  k <- which(cum_var >= min_explained)[1]
+  if (is.na(k)) k <- length(prop_var)
+
+  pc_cols <- paste0("PC", seq_len(k))
+
+  pc_scores <- as.data.frame(pca_index$x[, seq_len(k), drop = FALSE])
+  colnames(pc_scores) <- pc_cols
+
+  dat_index_pca <- bind_cols(
+    dat_index %>% select(sample_type, nesting_site),
+    pc_scores
+  )
+
+  weights <- prop_var[seq_len(k)]
+  weights <- weights / sum(weights)
+
+  pc_mat <- as.matrix(dat_index_pca %>% select(all_of(pc_cols)))
+  control_idx <- which(dat_index_pca$sample_type == "control")
+  control_centroid <- colMeans(pc_mat[control_idx, , drop = FALSE])
+
+  diffs2 <- (pc_mat - matrix(control_centroid, nrow = nrow(pc_mat), ncol = k, byrow = TRUE))^2
+  index_dist <- sqrt(diffs2 %*% weights)
+
+  dat_index_pca <- dat_index_pca %>%
+    mutate(hotspot_index = as.numeric(index_dist))
+
+  fit_hotspot <- lm(
+    hotspot_index ~ sample_type + nesting_site,
+    data = dat_index_pca
+  )
+
+  hotspot_result <- broom::tidy(fit_hotspot) %>%
+    filter(term == "sample_typenest") %>%
+    mutate(
+      index_type = group_label,
+      median_control = median(dat_index_pca$hotspot_index[dat_index_pca$sample_type == "control"], na.rm = TRUE),
+      median_nest = median(dat_index_pca$hotspot_index[dat_index_pca$sample_type == "nest"], na.rm = TRUE),
+      direction = case_when(
+        estimate > 0 ~ "higher_in_nest",
+        estimate < 0 ~ "lower_in_nest",
+        TRUE ~ "no_difference"
+      ),
+      n_samples = nrow(dat_index_pca),
+      n_vars = length(vars_used),
+      pcs_retained = k,
+      variance_explained = sum(prop_var[seq_len(k)])
+    )
+
+  pc1_var <- round(100 * prop_var[1], 1)
+  pc2_var <- round(100 * prop_var[2], 1)
+
+  scores_index_2d <- as.data.frame(pca_index$x[, 1:2]) %>%
+    rownames_to_column("sample_id") %>%
+    mutate(
+      sample_type = dat_index$sample_type,
+      nesting_site = dat_index$nesting_site
+    )
+
+  p_pca <- ggplot(scores_index_2d, aes(x = PC1, y = PC2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm"
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    labs(
+      title = paste(title_prefix, "composition"),
+      x = paste0("PC1 (", pc1_var, "%)"),
+      y = paste0("PC2 (", pc2_var, "%)")
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal"
+    )
+
+  p_index <- ggplot(
+    dat_index_pca,
+    aes(x = sample_type, y = hotspot_index, colour = sample_type)
+  ) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+    labs(
+      title = paste(title_prefix, "hotspot index"),
+      x = NULL,
+      y = "Distance from control centroid"
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+
+  list(
+    dat = dat_index_pca,
+    model = fit_hotspot,
+    result = hotspot_result,
+    pca_plot = p_pca,
+    index_plot = p_index
+  )
+}
+
+macro_index <- run_hotspot_index(
+  data = dat_nc,
+  vars = macro_vars,
+  group_label = "macro",
+  title_prefix = "Macronutrient"
+)
+
+micro_index <- run_hotspot_index(
+  data = dat_nc,
+  vars = micro_vars,
+  group_label = "micro",
+  title_prefix = "Micronutrient"
+)
+
+write_csv(macro_index$dat, "Table_macronutrient_hotspot_index_per_sample_2024.csv")
+write_csv(micro_index$dat, "Table_micronutrient_hotspot_index_per_sample_2024.csv")
+write_csv(macro_index$result, "Table_macronutrient_hotspot_index_model_2024.csv")
+write_csv(micro_index$result, "Table_micronutrient_hotspot_index_model_2024.csv")
+```
+
+```{r}
+
+# 2) Match ITS samples to nutrient data
+
+colnames(data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE))
+meta_ITS <- data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE) %>%
+  rownames_to_column("ps_rowname")
+
+names(meta_ITS)
+
+# 2) Match ITS samples to nutrient data
+
+normalize_sample_name <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    stringr::str_remove("(-ITS|_ITS)$") %>%
+    stringr::str_remove("(-16S|_16S)$")
+}
+
+strip_year_prefix <- function(x) {
+  x %>%
+    normalize_sample_name() %>%
+    stringr::str_remove("^[0-9]{4}-")
+}
+
+meta_ITS <- data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE) %>%
+  rownames_to_column("ps_rowname")
+
+# passende Spalte wählen
+id_col_ITS <- c("sample_name", "nest_ID", "slbez", "sample_id", "label")[
+  c("sample_name", "nest_ID", "slbez", "sample_id", "label") %in% names(meta_ITS)
+][1]
+
+if (is.na(id_col_ITS)) {
+  stop("No suitable ITS sample ID column found in metadata.")
+}
+
+cat("Using ITS ID column:", id_col_ITS, "\n")
+
+meta_ITS <- meta_ITS %>%
+  mutate(
+    sample_name_raw = .data[[id_col_ITS]],
+    sample_name_join = strip_year_prefix(sample_name_raw)
+  )
+
+nutrient_full <- dat_nc %>%
+  mutate(
+    sample_name_raw = slbez,
+    sample_name_join = strip_year_prefix(sample_name_raw)
+  ) %>%
+  select(
+    sample_name_raw,
+    sample_name_join,
+    sample_type,
+    nesting_site,
+    all_of(intersect(c(macro_vars, micro_vars), names(dat_nc)))
+  )
+
+otu_mat_ITS <- as(otu_table(ps_ITS_final), "matrix")
+if (taxa_are_rows(ps_ITS_final)) {
+  otu_mat_ITS <- t(otu_mat_ITS)
+}
+
+otu_df_ITS <- as.data.frame(otu_mat_ITS) %>%
+  rownames_to_column("ps_rowname")
+
+comm_df_full_ITS <- otu_df_ITS %>%
+  left_join(
+    meta_ITS %>% select(ps_rowname, sample_name_join),
+    by = "ps_rowname"
+  ) %>%
+  inner_join(
+    nutrient_full,
+    by = "sample_name_join"
+  )
+
+matched_n_ITS <- nrow(comm_df_full_ITS)
+cat("Matched ITS samples for nutrient integration:", matched_n_ITS, "\n")
+
+if (matched_n_ITS < 5) {
+  stop("Too few ITS samples matched to nutrient data even after harmonizing year prefixes.")
+}
+
+meta_ITS %>%
+  select(ps_rowname, sample_name_raw, sample_name_join) %>%
+  head(20)
+
+nutrient_full %>%
+  select(sample_name_raw, sample_name_join) %>%
+  head(20)
+
+intersect(meta_ITS$sample_name_join, nutrient_full$sample_name_join) %>%
+  head(30)
+```
+
+```{r}
+
+# dbRDA: nutrient gradients explaining ITS community structure
+
+
+library(phyloseq)
+library(vegan)
+library(janitor)
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(grid)
+
+set.seed(123)
+
+
+# 1) Match ITS samples to nutrient data
+
+
+normalize_sample_name <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    stringr::str_remove("(-ITS|_ITS)$") %>%
+    stringr::str_remove("(-16S|_16S)$")
+}
+
+strip_year_prefix <- function(x) {
+  x %>%
+    normalize_sample_name() %>%
+    stringr::str_remove("^[0-9]{4}-")
+}
+
+meta_ITS <- data.frame(sample_data(ps_ITS_final), stringsAsFactors = FALSE) %>%
+  rownames_to_column("ps_rowname")
+
+id_col_ITS <- c("sample_name", "nest_ID", "slbez", "sample_id", "label")[
+  c("sample_name", "nest_ID", "slbez", "sample_id", "label") %in% names(meta_ITS)
+][1]
+
+if (is.na(id_col_ITS)) {
+  stop("No suitable ITS sample ID column found in metadata.")
+}
+
+cat("Using ITS ID column:", id_col_ITS, "\n")
+
+meta_ITS <- meta_ITS %>%
+  mutate(
+    sample_name_raw = .data[[id_col_ITS]],
+    sample_name_join = strip_year_prefix(sample_name_raw)
+  )
+
+nutrient_full_ITS <- dat_nc %>%
+  mutate(
+    sample_name_raw = slbez,
+    sample_name_join = strip_year_prefix(sample_name_raw)
+  ) %>%
+  select(
+    sample_name_raw,
+    sample_name_join,
+    sample_type,
+    nesting_site,
+    all_of(intersect(c(macro_vars, micro_vars), names(dat_nc)))
+  )
+
+otu_mat_ITS <- as(otu_table(ps_ITS_final), "matrix")
+if (taxa_are_rows(ps_ITS_final)) {
+  otu_mat_ITS <- t(otu_mat_ITS)
+}
+
+otu_df_ITS <- as.data.frame(otu_mat_ITS) %>%
+  rownames_to_column("ps_rowname")
+
+comm_df_full_ITS <- otu_df_ITS %>%
+  left_join(
+    meta_ITS %>% select(ps_rowname, sample_name_join),
+    by = "ps_rowname"
+  ) %>%
+  inner_join(
+    nutrient_full_ITS,
+    by = "sample_name_join"
+  )
+
+matched_n_ITS <- nrow(comm_df_full_ITS)
+cat("Matched ITS samples for nutrient integration:", matched_n_ITS, "\n")
+
+if (matched_n_ITS < 5) {
+  stop("Too few ITS samples matched to nutrient data even after harmonizing year prefixes.")
+}
+
+
+# 2) Community matrix + environmental data
+
+
+comm_full_ITS <- comm_df_full_ITS %>%
+  select(-ps_rowname, -sample_name_join, -sample_name_raw, -sample_type, -nesting_site) %>%
+  select(where(is.numeric)) %>%
+  as.matrix()
+
+# besser nur echte OTUs/ASVs behalten:
+taxa_names_ITS <- taxa_names(ps_ITS_final)
+comm_full_ITS <- comm_df_full_ITS %>%
+  select(any_of(taxa_names_ITS)) %>%
+  as.matrix()
+
+keep_full_ITS <- rowSums(comm_full_ITS) > 0
+comm_full_ITS <- comm_full_ITS[keep_full_ITS, , drop = FALSE]
+
+env_full_ITS <- comm_df_full_ITS[keep_full_ITS, ] %>%
+  select(
+    sample_name = sample_name_join,
+    sample_type,
+    nesting_site,
+    all_of(intersect(c(macro_vars, micro_vars), names(comm_df_full_ITS)))
+  )
+
+env_full_ITS <- env_full_ITS %>%
+  mutate(
+    sample_type = factor(sample_type),
+    nesting_site = factor(nesting_site)
+  )
+
+comm_hel_full_ITS <- decostand(comm_full_ITS, method = "hellinger")
+
+
+# 3) Forward selection: macronutrients
+
+
+macro_candidates_ITS <- intersect(macro_vars, names(env_full_ITS))
+
+keep_macro_ITS <- complete.cases(env_full_ITS[, c("nesting_site", macro_candidates_ITS), drop = FALSE])
+comm_macro_ITS <- comm_hel_full_ITS[keep_macro_ITS, , drop = FALSE]
+env_macro_ITS  <- env_full_ITS[keep_macro_ITS, , drop = FALSE]
+
+mod0_macro_ITS <- capscale(
+  comm_macro_ITS ~ Condition(nesting_site),
+  data = env_macro_ITS,
+  distance = "bray"
+)
+
+mod1_macro_ITS <- capscale(
+  as.formula(
+    paste0(
+      "comm_macro_ITS ~ ",
+      paste(sprintf("log1p(`%s`)", macro_candidates_ITS), collapse = " + "),
+      " + Condition(nesting_site)"
+    )
+  ),
+  data = env_macro_ITS,
+  distance = "bray"
+)
+
+mod_sel_macro_ITS <- ordiR2step(
+  mod0_macro_ITS,
+  scope = formula(mod1_macro_ITS),
+  direction = "forward",
+  permutations = 999,
+  R2scope = TRUE,
+  trace = TRUE
+)
+
+anova_macro_overall_ITS <- anova(mod_sel_macro_ITS, permutations = 999)
+anova_macro_terms_ITS   <- anova(mod_sel_macro_ITS, by = "margin", permutations = 999)
+anova_macro_axes_ITS    <- anova(mod_sel_macro_ITS, by = "axis", permutations = 999)
+
+anova_macro_overall_ITS
+anova_macro_terms_ITS
+anova_macro_axes_ITS
+
+
+# 4) Forward selection: micronutrients
+
+
+micro_candidates_ITS <- intersect(micro_vars, names(env_full_ITS))
+
+keep_micro_ITS <- complete.cases(env_full_ITS[, c("nesting_site", micro_candidates_ITS), drop = FALSE])
+comm_micro_ITS <- comm_hel_full_ITS[keep_micro_ITS, , drop = FALSE]
+env_micro_ITS  <- env_full_ITS[keep_micro_ITS, , drop = FALSE]
+
+mod0_micro_ITS <- capscale(
+  comm_micro_ITS ~ Condition(nesting_site),
+  data = env_micro_ITS,
+  distance = "bray"
+)
+
+mod1_micro_ITS <- capscale(
+  as.formula(
+    paste0(
+      "comm_micro_ITS ~ ",
+      paste(sprintf("log1p(`%s`)", micro_candidates_ITS), collapse = " + "),
+      " + Condition(nesting_site)"
+    )
+  ),
+  data = env_micro_ITS,
+  distance = "bray"
+)
+
+mod_sel_micro_ITS <- ordiR2step(
+  mod0_micro_ITS,
+  scope = formula(mod1_micro_ITS),
+  direction = "forward",
+  permutations = 999,
+  R2scope = TRUE,
+  trace = TRUE
+)
+
+anova_micro_overall_ITS <- anova(mod_sel_micro_ITS, permutations = 999)
+anova_micro_terms_ITS   <- anova(mod_sel_micro_ITS, by = "margin", permutations = 999)
+anova_micro_axes_ITS    <- anova(mod_sel_micro_ITS, by = "axis", permutations = 999)
+
+anova_micro_overall_ITS
+anova_micro_terms_ITS
+anova_micro_axes_ITS
+
+
+# 5) Plot function
+
+
+plot_dbrda_selected <- function(mod, env_df, term_table, title_text, palette_values) {
+  
+  site_scores <- as.data.frame(scores(mod, display = "sites", choices = 1:2)) %>%
+    rownames_to_column("row_id")
+  colnames(site_scores)[2:3] <- c("CAP1", "CAP2")
+  
+  site_scores <- site_scores %>%
+    mutate(
+      sample_type = env_df$sample_type,
+      nesting_site = env_df$nesting_site,
+      sample_name = env_df$sample_name
+    )
+  
+  bp_raw <- as.data.frame(scores(mod, display = "bp", choices = 1:2)) %>%
+    rownames_to_column("variable_raw")
+  colnames(bp_raw)[2:3] <- c("CAP1", "CAP2")
+  
+  bp_raw <- bp_raw %>%
+    mutate(
+      variable = stringr::str_remove_all(variable_raw, "log1p\\(|\\)")
+    )
+  
+  term_pvals <- as.data.frame(term_table) %>%
+    rownames_to_column("term") %>%
+    as_tibble() %>%
+    filter(term != "Residual") %>%
+    transmute(
+      variable = stringr::str_remove_all(term, "log1p\\(|\\)"),
+      p_value = .data[["Pr(>F)"]]
+    )
+  
+  bp_scores <- bp_raw %>%
+    left_join(term_pvals, by = "variable") %>%
+    mutate(
+      variable_label = recode(variable, !!!nutrient_labels, .default = variable)
+    ) %>%
+    filter(!is.na(p_value), p_value < 0.05) %>%
+    mutate(
+      CAP1 = CAP1 * 1.15,
+      CAP2 = CAP2 * 1.15,
+      lab_x = CAP1 * 1.10,
+      lab_y = CAP2 * 1.10
+    )
+  
+  eig_vals <- eigenvals(mod)
+  axis1 <- round(100 * eig_vals[1] / sum(eig_vals[eig_vals > 0]), 1)
+  axis2 <- round(100 * eig_vals[2] / sum(eig_vals[eig_vals > 0]), 1)
+  
+  ggplot(site_scores, aes(x = CAP1, y = CAP2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm",
+      alpha = 0.9
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    geom_segment(
+      data = bp_scores,
+      aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
+      inherit.aes = FALSE,
+      arrow = arrow(length = unit(0.20, "cm")),
+      linewidth = 0.9,
+      colour = "grey30",
+      alpha = 0.9
+    ) +
+    geom_label(
+      data = bp_scores,
+      aes(x = lab_x, y = lab_y, label = variable_label),
+      inherit.aes = FALSE,
+      size = 3.8,
+      linewidth = 0,
+      fill = scales::alpha("white", 0.88),
+      colour = "grey15",
+      label.r = unit(0.12, "lines"),
+      label.padding = unit(0.12, "lines")
+    ) +
+    scale_colour_manual(values = palette_values) +
+    labs(
+      title = title_text,
+      x = paste0("dbRDA1 (", axis1, "%)"),
+      y = paste0("dbRDA2 (", axis2, "%)")
+    ) +
+    theme_pub_ITS +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+    )
+}
+
+
+# 6) ITS plots
+
+
+p_dbrda_macro_sel_ITS <- plot_dbrda_selected(
+  mod = mod_sel_macro_ITS,
+  env_df = env_macro_ITS,
+  term_table = anova_macro_terms_ITS,
+  title_text = "Fungal community constrained by macronutrients",
+  palette_values = pal_main_ITS
+)
+
+p_dbrda_micro_sel_ITS <- plot_dbrda_selected(
+  mod = mod_sel_micro_ITS,
+  env_df = env_micro_ITS,
+  term_table = anova_micro_terms_ITS,
+  title_text = "Fungal community constrained by micronutrients",
+  palette_values = pal_main_ITS
+)
+
+
+# 7) Export
+
+write_csv(
+  broom::tidy(anova_macro_terms_ITS) %>% clean_names(),
+  "Table_dbRDA_ITS_macronutrient_terms_selected_2024.csv"
+)
+
+write_csv(
+  broom::tidy(anova_micro_terms_ITS) %>% clean_names(),
+  "Table_dbRDA_ITS_micronutrient_terms_selected_2024.csv"
+)
+
+```
+
+```{r}
+
+# Mechanism (ITS): selected nutrients and reproductive parameters
+# sodium, organic nitrogen, and manganese
+
+library(tidyverse)
+library(broom)
+library(patchwork)
+
+# 1) Prepare analysis data
+
+dat_nc2_ITS <- dat_nc %>%
+  mutate(
+    nest_depth = to_numeric_comma(nest_depth),
+    total_egg_number = to_numeric_comma(total_egg_number),
+    egg_number_hatched = to_numeric_comma(egg_number_hatched),
+    egg_number_undeveloped = to_numeric_comma(egg_number_undeveloped),
+    failure_unknowncause = to_numeric_comma(failure_unknowncause),
+    hatching_rate = to_numeric_comma(hatching_rate),
+    emergence_rate = to_numeric_comma(emergence_rate),
+    failed_eggs = if_else(
+      is.na(egg_number_undeveloped) & is.na(failure_unknowncause),
+      NA_real_,
+      rowSums(cbind(egg_number_undeveloped, failure_unknowncause), na.rm = TRUE)
+    ),
+    na = as.numeric(na),
+    norg_de = as.numeric(norg_de),
+    mn3 = as.numeric(mn3)
+  )
+
+dat_nest_ITS <- dat_nc2_ITS %>%
+  filter(sample_type == "nest") %>%
+  mutate(
+    failed_eggs = as.numeric(failed_eggs),
+    total_egg_number = as.numeric(total_egg_number),
+    nest_depth = as.numeric(nest_depth),
+    hatching_rate = as.numeric(hatching_rate),
+    emergence_rate = as.numeric(emergence_rate)
+  )
+
+# 2) Nutrient–nutrient correlations (optional overview)
+
+cor_na_norg_ITS <- cor.test(
+  log1p(dat_nest_ITS$na),
+  log1p(dat_nest_ITS$norg_de),
+  method = "spearman"
+)
+
+cor_na_mn_ITS <- cor.test(
+  log1p(dat_nest_ITS$na),
+  log1p(dat_nest_ITS$mn3),
+  method = "spearman"
+)
+
+cor_norg_mn_ITS <- cor.test(
+  log1p(dat_nest_ITS$norg_de),
+  log1p(dat_nest_ITS$mn3),
+  method = "spearman"
+)
+
+
+# 3) Reproductive mechanism models
+# failed eggs
+
+fit_na_failed_ITS <- lm(
+  log1p(na) ~ failed_eggs + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest_ITS
+)
+
+fit_norg_failed_ITS <- lm(
+  log1p(norg_de) ~ failed_eggs + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest_ITS
+)
+
+fit_mn_failed_ITS <- lm(
+  log1p(mn3) ~ failed_eggs + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest_ITS
+)
+
+
+
+# 8) Prediction data for failed-eggs figure
+
+make_effect_df_ITS <- function(data, model, nutrient_var, nutrient_label) {
+  
+  x_seq <- seq(
+    min(data$failed_eggs, na.rm = TRUE),
+    max(data$failed_eggs, na.rm = TRUE),
+    length.out = 200
+  )
+  
+  ref_site <- names(sort(table(data$nesting_site), decreasing = TRUE))[1]
+  
+  newdat <- tibble(
+    failed_eggs = x_seq,
+    total_egg_number = median(data$total_egg_number, na.rm = TRUE),
+    nest_depth = median(data$nest_depth, na.rm = TRUE),
+    nesting_site = factor(ref_site, levels = levels(data$nesting_site))
+  )
+  
+  pred <- predict(model, newdata = newdat, se.fit = TRUE)
+  
+  newdat %>%
+    mutate(
+      fit_link = pred$fit,
+      se_link = pred$se.fit,
+      fit = exp(fit_link) - 1,
+      lwr = exp(fit_link - 1.96 * se_link) - 1,
+      upr = exp(fit_link + 1.96 * se_link) - 1,
+      nutrient = nutrient_label,
+      nutrient_var = nutrient_var
+    )
+}
+
+pred_na_ITS <- make_effect_df_ITS(
+  data = dat_nest_ITS,
+  model = fit_na_failed_ITS,
+  nutrient_var = "na",
+  nutrient_label = "Sodium"
+)
+
+pred_norg_ITS <- make_effect_df_ITS(
+  data = dat_nest_ITS,
+  model = fit_norg_failed_ITS,
+  nutrient_var = "norg_de",
+  nutrient_label = "Organic nitrogen"
+)
+
+pred_mn_ITS <- make_effect_df_ITS(
+  data = dat_nest_ITS,
+  model = fit_mn_failed_ITS,
+  nutrient_var = "mn3",
+  nutrient_label = "Manganese"
+)
+
+
+# 9) Raw point data
+
+points_na_ITS <- dat_nest_ITS %>%
+  transmute(
+    failed_eggs,
+    nutrient_value = na,
+    nutrient = "Sodium"
+  )
+
+points_norg_ITS <- dat_nest_ITS %>%
+  transmute(
+    failed_eggs,
+    nutrient_value = norg_de,
+    nutrient = "Organic nitrogen"
+  )
+
+points_mn_ITS <- dat_nest_ITS %>%
+  transmute(
+    failed_eggs,
+    nutrient_value = mn3,
+    nutrient = "Manganese"
+  )
+
+points_all_ITS <- bind_rows(
+  points_na_ITS,
+  points_norg_ITS,
+  points_mn_ITS
+)
+
+pred_all_ITS <- bind_rows(
+  pred_na_ITS,
+  pred_norg_ITS,
+  pred_mn_ITS
+)
+
+
+# 10) Plotting function
+
+plot_mechanism_adjusted_ITS <- function(points_df, pred_df, nutrient_name, ylab_text) {
+  
+  pts <- points_df %>% filter(nutrient == nutrient_name)
+  prd <- pred_df %>% filter(nutrient == nutrient_name)
+  
+  ggplot() +
+    geom_point(
+      data = pts,
+      aes(x = failed_eggs, y = nutrient_value),
+      colour = unname(pal_main_ITS["nest"]),
+      size = 4.6,
+      alpha = 0.70
+    ) +
+    geom_ribbon(
+      data = prd,
+      aes(x = failed_eggs, ymin = lwr, ymax = upr),
+      fill = unname(pal_main_ITS["nest"]),
+      alpha = 0.14
+    ) +
+    geom_line(
+      data = prd,
+      aes(x = failed_eggs, y = fit),
+      colour = unname(pal_main_ITS["nest"]),
+      linewidth = 1.2
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.12))
+    ) +
+    scale_x_continuous(
+      breaks = scales::pretty_breaks(n = 6)
+    ) +
+    labs(
+      title = nutrient_name,
+      x = "Number of undeveloped eggs",
+      y = ylab_text
+    ) +
+    theme_pub_ITS +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+}
+
+
+# 11) Main ITS mechanism figure
+
+p_na_failed_adj_ITS <- plot_mechanism_adjusted_ITS(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Sodium",
+  ylab_text = "mg/100g"
+)
+
+p_norg_failed_adj_ITS <- plot_mechanism_adjusted_ITS(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Organic nitrogen",
+  ylab_text = "mg/100g"
+)
+
+p_mn_failed_adj_ITS <- plot_mechanism_adjusted_ITS(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Manganese",
+  ylab_text = "mg/100g"
+)
+
+p_mechanism_main_ITS <- p_na_failed_adj_ITS | p_norg_failed_adj_ITS | p_mn_failed_adj_ITS
+
+p_mechanism_main_ITS
+
+ggsave(
+  "Figure_mechanism_ITS_failed_eggs_selected_nutrients_2024.png",
+  p_mechanism_main_ITS,
+  width = 17,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+
+# 12) Compact console output
+
+cat("\n============================================================\n")
+cat("ITS mechanism models: selected nutrients in nests\n")
+cat("============================================================\n")
+
+cat("\nSpearman correlation: sodium vs organic nitrogen\n")
+print(cor_na_norg_ITS)
+
+cat("\nSpearman correlation: sodium vs manganese\n")
+print(cor_na_mn_ITS)
+
+cat("\nSpearman correlation: organic nitrogen vs manganese\n")
+print(cor_norg_mn_ITS)
+
+cat("\nSodium ~ failed eggs + clutch size + nest depth + site:\n")
+print(summary(fit_na_failed_ITS))
+
+cat("\nOrganic nitrogen ~ failed eggs + clutch size + nest depth + site:\n")
+print(summary(fit_norg_failed_ITS))
+
+cat("\nManganese ~ failed eggs + clutch size + nest depth + site:\n")
+print(summary(fit_mn_failed_ITS))
+
+cat("\nSodium ~ hatching rate + nest depth + site:\n")
+print(summary(fit_na_hatching_ITS))
+
+cat("\nOrganic nitrogen ~ hatching rate + nest depth + site:\n")
+print(summary(fit_norg_hatching_ITS))
+
+cat("\nManganese ~ hatching rate + nest depth + site:\n")
+print(summary(fit_mn_hatching_ITS))
+
+cat("\nSodium ~ emergence rate + nest depth + site:\n")
+print(summary(fit_na_emergence_ITS))
+
+cat("\nOrganic nitrogen ~ emergence rate + nest depth + site:\n")
+print(summary(fit_norg_emergence_ITS))
+
+cat("\nManganese ~ emergence rate + nest depth + site:\n")
+print(summary(fit_mn_emergence_ITS))
+```
+
+```{r}
+# 
+# Figure 3: equal-sized 8-panel layout with fixed tags A–H
+# 
+
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(grid)
+library(cowplot)
+
+
+# Helper: add fixed panel tag
+
+add_panel_tag <- function(p, tag_letter) {
+  p +
+    labs(tag = tag_letter) +
+    theme(
+      plot.tag = element_text(face = "bold", size = 16),
+      plot.tag.position = c(0.02, 0.98)
+    )
+}
+
+# 
+# Helper: pretty dbRDA plot with fixed nutrient label positions
+# 
+
+plot_dbrda_selected_pretty2 <- function(
+    mod,
+    env_df,
+    term_table,
+    title_text,
+    palette_values,
+    base_theme,
+    sodium_lab_x_mult = 1.45,
+    sodium_lab_y_mult = 1.55,
+    sulfur_lab_x_mult = 1.18,
+    sulfur_lab_y_mult = 1.18,
+    norg_lab_x_mult   = 1.18,
+    norg_lab_y_mult   = 1.18,
+    mn_lab_x_mult     = 1.18,
+    mn_lab_y_mult     = 1.18,
+    mn_lab_y_add      = 0
+) {
+  
+  site_scores <- as.data.frame(scores(mod, display = "sites", choices = 1:2)) %>%
+    rownames_to_column("row_id")
+  colnames(site_scores)[2:3] <- c("CAP1", "CAP2")
+  
+  site_scores <- site_scores %>%
+    mutate(
+      sample_type = env_df$sample_type,
+      nesting_site = env_df$nesting_site,
+      sample_name = env_df$sample_name
+    )
+  
+  bp_raw <- as.data.frame(scores(mod, display = "bp", choices = 1:2)) %>%
+    rownames_to_column("variable_raw")
+  colnames(bp_raw)[2:3] <- c("CAP1", "CAP2")
+  
+  bp_raw <- bp_raw %>%
+    mutate(
+      variable = stringr::str_remove_all(variable_raw, "log1p\\(|\\)")
+    )
+  
+  term_pvals <- as.data.frame(term_table) %>%
+    rownames_to_column("term") %>%
+    as_tibble() %>%
+    filter(term != "Residual") %>%
+    transmute(
+      variable = stringr::str_remove_all(term, "log1p\\(|\\)"),
+      p_value = .data[["Pr(>F)"]]
+    )
+  
+  bp_scores <- bp_raw %>%
+    left_join(term_pvals, by = "variable") %>%
+    mutate(
+      variable_label = recode(variable, !!!nutrient_labels, .default = variable)
+    ) %>%
+    filter(!is.na(p_value), p_value < 0.05) %>%
+    mutate(
+      CAP1 = CAP1 * 1.18,
+      CAP2 = CAP2 * 1.18,
+      lab_x = CAP1 * 1.18,
+      lab_y = CAP2 * 1.18
+    ) %>%
+    mutate(
+      lab_x = case_when(
+  stringr::str_detect(variable_label, regex("^Sodium$", ignore_case = TRUE)) ~ CAP1 * sodium_lab_x_mult,
+  stringr::str_detect(variable_label, regex("^Sulfur$", ignore_case = TRUE)) ~ CAP1 * sulfur_lab_x_mult,
+  stringr::str_detect(variable_label, regex("^Organic nitrogen$", ignore_case = TRUE)) ~ CAP1 * norg_lab_x_mult,
+  stringr::str_detect(variable_label, regex("^Manganese$", ignore_case = TRUE)) ~ CAP1 * mn_lab_x_mult,
+  TRUE ~ lab_x
+),
+lab_y = case_when(
+  variable == "na"      ~ CAP2 * sodium_lab_y_mult,
+  variable == "s_icp"   ~ CAP2 * sulfur_lab_y_mult,
+  variable == "norg_de" ~ CAP2 * norg_lab_y_mult,
+  variable == "mn3"     ~ CAP2 * mn_lab_y_mult + mn_lab_y_add,
+  TRUE ~ lab_y
+)
+    )
+  
+  eig_vals <- eigenvals(mod)
+  axis1 <- round(100 * eig_vals[1] / sum(eig_vals[eig_vals > 0]), 1)
+  axis2 <- round(100 * eig_vals[2] / sum(eig_vals[eig_vals > 0]), 1)
+  
+  p <- ggplot(site_scores, aes(x = CAP1, y = CAP2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm",
+      alpha = 0.9
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = palette_values) +
+    labs(
+      title = title_text,
+      x = paste0("dbRDA1 (", axis1, "%)"),
+      y = paste0("dbRDA2 (", axis2, "%)")
+    ) +
+    base_theme +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+  
+  if (nrow(bp_scores) > 0) {
+    p <- p +
+      geom_segment(
+        data = bp_scores,
+        aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
+        inherit.aes = FALSE,
+        arrow = arrow(length = unit(0.20, "cm")),
+        linewidth = 0.9,
+        colour = "grey30",
+        alpha = 0.95
+      ) +
+      geom_label(
+        data = bp_scores,
+        aes(x = lab_x, y = lab_y, label = variable_label),
+        inherit.aes = FALSE,
+        size = 3.6,
+        linewidth = 0,
+        fill = scales::alpha("white", 0.88),
+        colour = "grey15",
+        label.r = unit(0.12, "lines"),
+        label.padding = unit(0.12, "lines")
+      )
+  }
+  
+  p
+}
+
+# 
+# Helper: mechanism plot
+# 
+plot_mechanism_adjusted2 <- function(points_df, pred_df, nutrient_name, ylab_text,
+                                     line_type = "solid",
+                                     palette_value,
+                                     base_theme,
+                                     line_alpha = 1) {
+  
+  pts <- points_df %>% filter(nutrient == nutrient_name)
+  prd <- pred_df %>% filter(nutrient == nutrient_name)
+  
+  ggplot() +
+    geom_point(
+      data = pts,
+      aes(x = failed_eggs, y = nutrient_value),
+      colour = unname(palette_value),
+      size = 4.6,
+      alpha = 0.70
+    ) +
+    geom_ribbon(
+      data = prd,
+      aes(x = failed_eggs, ymin = lwr, ymax = upr),
+      fill = unname(palette_value),
+      alpha = 0.14
+    ) +
+    geom_line(
+      data = prd,
+      aes(x = failed_eggs, y = fit),
+      colour = unname(palette_value),
+      linewidth = 1.2,
+      linetype = line_type,
+      alpha = line_alpha
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.12))
+    ) +
+    scale_x_continuous(
+      breaks = scales::pretty_breaks(n = 6)
+    ) +
+    labs(
+      title = nutrient_name,
+      x = "Number of undeveloped eggs",
+      y = ylab_text
+    ) +
+    base_theme +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+}
+
+# 
+# Build plots A–H
+# 
+
+p_fig3_a <- plot_dbrda_selected_pretty2(
+  mod = mod_sel_macro,
+  env_df = env_macro,
+  term_table = anova_macro_terms,
+  title_text = "Bacterial macronutrient gradients",
+  palette_values = pal_main,
+  base_theme = theme_pub,
+  sodium_lab_x_mult = 1.45,
+  sodium_lab_y_mult = 1.55,
+  sulfur_lab_x_mult = 1.18,
+  sulfur_lab_y_mult = 1.85
+) %>% add_panel_tag("A")
+
+p_fig3_b <- plot_dbrda_selected_pretty2(
+  mod = mod_sel_micro,
+  env_df = env_micro,
+  term_table = anova_micro_terms,
+  title_text = "Bacterial micronutrient gradients",
+  palette_values = pal_main,
+  base_theme = theme_pub
+) %>% add_panel_tag("B")
+
+p_fig3_c <- plot_dbrda_selected_pretty2(
+  mod = mod_sel_macro_ITS,
+  env_df = env_macro_ITS,
+  term_table = anova_macro_terms_ITS,
+  title_text = "Fungal macronutrient gradients",
+  palette_values = pal_main_ITS,
+  base_theme = theme_pub_ITS,
+  sodium_lab_x_mult = 1.45,
+  sodium_lab_y_mult = 1.55,
+  norg_lab_x_mult = 1.18,
+  norg_lab_y_mult = 1.7
+) %>% add_panel_tag("C")
+
+p_fig3_d <- plot_dbrda_selected_pretty2(
+  mod = mod_sel_micro_ITS,
+  env_df = env_micro_ITS,
+  term_table = anova_micro_terms_ITS,
+  title_text = "Fungal micronutrient gradients",
+  palette_values = pal_main_ITS,
+  base_theme = theme_pub_ITS,
+  mn_lab_x_mult = 1.18,
+  mn_lab_y_mult = 1.18,
+  mn_lab_y_add = -0.4
+) %>% add_panel_tag("D")
+
+p_fig3_e <- plot_mechanism_adjusted2(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Sodium",
+  ylab_text = "mg/100g",
+  line_type = "solid",
+  palette_value = pal_main_ITS["nest"],
+  base_theme = theme_pub_ITS,
+  line_alpha = 1
+) %>% add_panel_tag("E")
+
+p_fig3_f <- plot_mechanism_adjusted2(
+  points_df = points_all,
+  pred_df = pred_all,
+  nutrient_name = "Sulfur",
+  ylab_text = "mg/100g",
+  line_type = "dashed",
+  palette_value = pal_main["nest"],
+  base_theme = theme_pub,
+  line_alpha = 0.9
+) %>% add_panel_tag("F")
+
+p_fig3_g <- plot_mechanism_adjusted2(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Organic nitrogen",
+  ylab_text = "mg/100g",
+  line_type = "dashed",
+  palette_value = pal_main_ITS["nest"],
+  base_theme = theme_pub_ITS,
+  line_alpha = 0.9
+) %>% add_panel_tag("G")
+
+p_fig3_h <- plot_mechanism_adjusted2(
+  points_df = points_all_ITS,
+  pred_df = pred_all_ITS,
+  nutrient_name = "Manganese",
+  ylab_text = "mg/100g",
+  line_type = "dashed",
+  palette_value = pal_main_ITS["nest"],
+  base_theme = theme_pub_ITS,
+  line_alpha = 0.9
+) %>% add_panel_tag("H")
+
+# 
+# One shared legend, separate from the 8 equal panels
+# 
+legend_plot <- ggplot(
+  bind_rows(
+    tibble(sample_type = factor(c("control", "nest"), levels = c("control", "nest")),
+           x = 1:2, y = 1:2)
+  ),
+  aes(x = x, y = y, colour = sample_type)
+) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = pal_main, name = NULL) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.text = element_text(size = 11)
+  )
+
+shared_legend <- cowplot::get_legend(legend_plot)
+
+
+# 
+# Build 4 equal rows
+# 
+
+row1 <- cowplot::plot_grid(
+  p_fig3_a, p_fig3_b,
+  ncol = 2,
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1)
+)
+
+row2 <- cowplot::plot_grid(
+  p_fig3_c, p_fig3_d,
+  ncol = 2,
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1)
+)
+
+row3 <- cowplot::plot_grid(
+  p_fig3_e, p_fig3_f,
+  ncol = 2,
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1)
+)
+
+row4 <- cowplot::plot_grid(
+  p_fig3_g, p_fig3_h,
+  ncol = 2,
+  align = "hv",
+  axis = "tblr",
+  rel_widths = c(1, 1)
+)
+
+# ------------------------------------------------------------
+# Combine rows + legend
+# ------------------------------------------------------------
+
+
+p_fig3_full <- cowplot::plot_grid(
+  row1,
+  row2,
+  row3,
+  row4,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 1, 1, 1, 0.12)
+)
+
+p_fig3_full
+
+```
+

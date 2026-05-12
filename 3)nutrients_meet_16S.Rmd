@@ -1,0 +1,991 @@
+---
+title: "3)nutrients_meet_16S"
+---
+
+```{r}
+
+# PCA-based hotspot indices for macro- and micronutrients
+
+
+library(tidyverse)
+library(broom)
+library(vegan)
+library(patchwork)
+library(grid)
+
+set.seed(123)
+
+
+# Shared colour palette for all figures
+
+
+pal_main <- c(
+  "control" = "#053B45",
+  "nest"    = "#B8AA50"
+)
+###
+
+run_hotspot_index <- function(data, vars, group_label, title_prefix,
+                              min_explained = 0.80) {
+  
+  vars <- intersect(vars, names(data))
+  
+  dat_index <- data %>%
+    select(sample_type, nesting_site, all_of(vars)) %>%
+    drop_na()
+  
+  X_index <- dat_index %>%
+    select(all_of(vars)) %>%
+    mutate(across(everything(), log1p)) %>%
+    as.matrix()
+  
+  X_index <- X_index[, apply(X_index, 2, sd, na.rm = TRUE) > 0, drop = FALSE]
+  vars_used <- colnames(X_index)
+  X_index_scaled <- scale(X_index)
+  
+  pca_index <- prcomp(X_index_scaled, center = FALSE, scale. = FALSE)
+  
+  prop_var <- (pca_index$sdev^2) / sum(pca_index$sdev^2)
+  cum_var <- cumsum(prop_var)
+  
+  k <- which(cum_var >= min_explained)[1]
+  if (is.na(k)) k <- length(prop_var)
+  
+  pc_cols <- paste0("PC", seq_len(k))
+  
+  pc_scores <- as.data.frame(pca_index$x[, seq_len(k), drop = FALSE])
+  colnames(pc_scores) <- pc_cols
+  
+  dat_index_pca <- bind_cols(
+    dat_index %>% select(sample_type, nesting_site),
+    pc_scores
+  )
+  
+  weights <- prop_var[seq_len(k)]
+  weights <- weights / sum(weights)
+  
+  pc_mat <- as.matrix(dat_index_pca %>% select(all_of(pc_cols)))
+  control_idx <- which(dat_index_pca$sample_type == "control")
+  control_centroid <- colMeans(pc_mat[control_idx, , drop = FALSE])
+  
+  diffs2 <- (pc_mat - matrix(control_centroid, nrow = nrow(pc_mat), ncol = k, byrow = TRUE))^2
+  index_dist <- sqrt(diffs2 %*% weights)
+  
+  dat_index_pca <- dat_index_pca %>%
+    mutate(hotspot_index = as.numeric(index_dist))
+  
+  fit_hotspot <- lm(
+    hotspot_index ~ sample_type + nesting_site,
+    data = dat_index_pca
+  )
+  
+  hotspot_result <- broom::tidy(fit_hotspot) %>%
+    filter(term == "sample_typenest") %>%
+    mutate(
+      index_type = group_label,
+      median_control = median(dat_index_pca$hotspot_index[dat_index_pca$sample_type == "control"], na.rm = TRUE),
+      median_nest = median(dat_index_pca$hotspot_index[dat_index_pca$sample_type == "nest"], na.rm = TRUE),
+      direction = case_when(
+        estimate > 0 ~ "higher_in_nest",
+        estimate < 0 ~ "lower_in_nest",
+        TRUE ~ "no_difference"
+      ),
+      n_samples = nrow(dat_index_pca),
+      n_vars = length(vars_used),
+      pcs_retained = k,
+      variance_explained = sum(prop_var[seq_len(k)])
+    )
+  
+  pc1_var <- round(100 * prop_var[1], 1)
+  pc2_var <- round(100 * prop_var[2], 1)
+  
+  scores_index_2d <- as.data.frame(pca_index$x[, 1:2]) %>%
+    rownames_to_column("sample_id") %>%
+    mutate(
+      sample_type = dat_index$sample_type,
+      nesting_site = dat_index$nesting_site
+    )
+  
+  p_pca <- ggplot(scores_index_2d, aes(x = PC1, y = PC2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm"
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    labs(
+      title = paste(title_prefix, "composition"),
+      x = paste0("PC1 (", pc1_var, "%)"),
+      y = paste0("PC2 (", pc2_var, "%)")
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal"
+    )
+  
+  p_index <- ggplot(
+    dat_index_pca,
+    aes(x = sample_type, y = hotspot_index, colour = sample_type)
+  ) +
+    geom_boxplot(
+      aes(group = sample_type),
+      width = 0.52,
+      fill = "white",
+      linewidth = 1.0,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.08,
+      size = 4.0,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+    labs(
+      title = paste(title_prefix, "hotspot index"),
+      x = NULL,
+      y = "Distance from control centroid"
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+  
+  list(
+    dat = dat_index_pca,
+    model = fit_hotspot,
+    result = hotspot_result,
+    pca_plot = p_pca,
+    index_plot = p_index
+  )
+}
+
+macro_index <- run_hotspot_index(
+  data = dat_nc,
+  vars = macro_vars,
+  group_label = "macro",
+  title_prefix = "Macronutrient"
+)
+
+micro_index <- run_hotspot_index(
+  data = dat_nc,
+  vars = micro_vars,
+  group_label = "micro",
+  title_prefix = "Micronutrient"
+)
+
+write_csv(macro_index$dat, "Table_macronutrient_hotspot_index_per_sample_2024.csv")
+write_csv(micro_index$dat, "Table_micronutrient_hotspot_index_per_sample_2024.csv")
+write_csv(macro_index$result, "Table_macronutrient_hotspot_index_model_2024.csv")
+write_csv(micro_index$result, "Table_micronutrient_hotspot_index_model_2024.csv")
+
+
+```
+
+
+
+```{r}
+
+# dbRDA: nutrient gradients explaining 16S community structure
+
+
+library(phyloseq)
+library(vegan)
+library(janitor)
+
+set.seed(123)
+
+
+# 1) Match 16S samples to nutrient data
+
+otu_mat <- as(otu_table(ps_final), "matrix")
+if (taxa_are_rows(ps_final)) {
+  otu_mat <- t(otu_mat)
+}
+otu_mat <- as.data.frame(otu_mat) %>%
+  rownames_to_column("ps_rowname")
+
+meta_16s <- data.frame(sample_data(ps_final)) %>%
+  rownames_to_column("ps_rowname") %>%
+  mutate(sample_name = as.character(nest_ID))
+
+nutrient_full <- dat_nc %>%
+  mutate(sample_name = as.character(slbez)) %>%
+  select(
+    sample_name,
+    sample_type,
+    nesting_site,
+    all_of(intersect(c(macro_vars, micro_vars), names(dat_nc)))
+  )
+
+comm_df_full <- otu_mat %>%
+  left_join(meta_16s %>% select(ps_rowname, sample_name), by = "ps_rowname") %>%
+  inner_join(nutrient_full, by = "sample_name")
+
+comm_full <- comm_df_full %>%
+  select(starts_with("ASV_")) %>%
+  as.matrix()
+
+keep_full <- rowSums(comm_full) > 0
+comm_full <- comm_full[keep_full, , drop = FALSE]
+
+env_full <- comm_df_full[keep_full, ] %>%
+  select(sample_name, sample_type, nesting_site, all_of(intersect(c(macro_vars, micro_vars), names(comm_df_full))))
+
+comm_hel_full <- decostand(comm_full, method = "hellinger")
+
+
+# 2) Forward selection: macronutrients
+
+macro_candidates <- intersect(macro_vars, names(env_full))
+
+keep_macro <- complete.cases(env_full[, c("nesting_site", macro_candidates), drop = FALSE])
+comm_macro <- comm_hel_full[keep_macro, , drop = FALSE]
+env_macro  <- env_full[keep_macro, , drop = FALSE]
+
+mod0_macro <- capscale(
+  comm_macro ~ Condition(nesting_site),
+  data = env_macro,
+  distance = "bray"
+)
+
+mod1_macro <- capscale(
+  as.formula(
+    paste0(
+      "comm_macro ~ ",
+      paste(sprintf("log1p(`%s`)", macro_candidates), collapse = " + "),
+      " + Condition(nesting_site)"
+    )
+  ),
+  data = env_macro,
+  distance = "bray"
+)
+
+mod_sel_macro <- ordiR2step(
+  mod0_macro,
+  scope = formula(mod1_macro),
+  direction = "forward",
+  permutations = 999,
+  R2scope = TRUE,
+  trace = TRUE
+)
+
+anova_macro_overall <- anova(mod_sel_macro, permutations = 999)
+anova_macro_terms   <- anova(mod_sel_macro, by = "margin", permutations = 999)
+anova_macro_axes    <- anova(mod_sel_macro, by = "axis", permutations = 999)
+
+anova_macro_overall
+anova_macro_terms
+anova_macro_axes
+
+# 3) Forward selection: micronutrients (sensitivity analysis)
+
+micro_candidates <- intersect(micro_vars, names(env_full))
+
+keep_micro <- complete.cases(env_full[, c("nesting_site", micro_candidates), drop = FALSE])
+comm_micro <- comm_hel_full[keep_micro, , drop = FALSE]
+env_micro  <- env_full[keep_micro, , drop = FALSE]
+
+mod0_micro <- capscale(
+  comm_micro ~ Condition(nesting_site),
+  data = env_micro,
+  distance = "bray"
+)
+
+mod1_micro <- capscale(
+  as.formula(
+    paste0(
+      "comm_micro ~ ",
+      paste(sprintf("log1p(`%s`)", micro_candidates), collapse = " + "),
+      " + Condition(nesting_site)"
+    )
+  ),
+  data = env_micro,
+  distance = "bray"
+)
+
+mod_sel_micro <- ordiR2step(
+  mod0_micro,
+  scope = formula(mod1_micro),
+  direction = "forward",
+  permutations = 999,
+  R2scope = TRUE,
+  trace = TRUE
+)
+
+anova_micro_overall <- anova(mod_sel_micro, permutations = 999)
+anova_micro_terms   <- anova(mod_sel_micro, by = "margin", permutations = 999)
+anova_micro_axes    <- anova(mod_sel_micro, by = "axis", permutations = 999)
+
+anova_micro_overall
+anova_micro_terms
+anova_micro_axes
+
+
+# 4) Plot function
+
+plot_dbrda_selected <- function(mod, env_df, term_table, title_text) {
+  
+  site_scores <- as.data.frame(scores(mod, display = "sites", choices = 1:2)) %>%
+    rownames_to_column("row_id")
+  colnames(site_scores)[2:3] <- c("CAP1", "CAP2")
+  
+  site_scores <- site_scores %>%
+    mutate(
+      sample_type = env_df$sample_type,
+      nesting_site = env_df$nesting_site,
+      sample_name = env_df$sample_name
+    )
+  
+  bp_raw <- as.data.frame(scores(mod, display = "bp", choices = 1:2)) %>%
+    rownames_to_column("variable_raw")
+  colnames(bp_raw)[2:3] <- c("CAP1", "CAP2")
+  
+  bp_raw <- bp_raw %>%
+    mutate(
+      variable = str_remove_all(variable_raw, "log1p\\(|\\)")
+    )
+  
+  term_pvals <- as.data.frame(term_table) %>%
+    rownames_to_column("term") %>%
+    as_tibble() %>%
+    filter(term != "Residual") %>%
+    transmute(
+      variable = str_remove_all(term, "log1p\\(|\\)"),
+      p_value = .data[["Pr(>F)"]]
+    )
+  
+  bp_scores <- bp_raw %>%
+    left_join(term_pvals, by = "variable") %>%
+    mutate(
+      variable_label = recode(variable, !!!nutrient_labels, .default = variable)
+    ) %>%
+    filter(!is.na(p_value), p_value < 0.05) %>%
+    mutate(
+      CAP1 = CAP1 * 1.15,
+      CAP2 = CAP2 * 1.15,
+      lab_x = CAP1 * 1.10,
+      lab_y = CAP2 * 1.10
+    )
+  
+  eig_vals <- eigenvals(mod)
+  axis1 <- round(100 * eig_vals[1] / sum(eig_vals[eig_vals > 0]), 1)
+  axis2 <- round(100 * eig_vals[2] / sum(eig_vals[eig_vals > 0]), 1)
+  
+  ggplot(site_scores, aes(x = CAP1, y = CAP2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm",
+      alpha = 0.9
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    geom_segment(
+      data = bp_scores,
+      aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
+      inherit.aes = FALSE,
+      arrow = arrow(length = unit(0.20, "cm")),
+      linewidth = 0.9,
+      colour = "grey30",
+      alpha = 0.9
+    ) +
+    geom_label(
+      data = bp_scores,
+      aes(x = lab_x, y = lab_y, label = variable_label),
+      inherit.aes = FALSE,
+      size = 3.8,
+      linewidth = 0,
+      fill = scales::alpha("white", 0.88),
+      colour = "grey15",
+      label.r = unit(0.12, "lines"),
+      label.padding = unit(0.12, "lines")
+    ) +
+    scale_colour_manual(values = pal_main) +
+    labs(
+      title = title_text,
+      x = paste0("dbRDA1 (", axis1, "%)"),
+      y = paste0("dbRDA2 (", axis2, "%)")
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+    )
+}
+
+p_dbrda_macro_sel <- plot_dbrda_selected(
+  mod = mod_sel_macro,
+  env_df = env_macro,
+  term_table = anova_macro_terms,
+  title_text = "Microbial community constrained by macronutrients"
+)
+
+p_dbrda_micro_sel <- plot_dbrda_selected(
+  mod = mod_sel_micro,
+  env_df = env_micro,
+  term_table = anova_micro_terms,
+  title_text = "Microbial community constrained by micronutrients"
+)
+
+write_csv(broom::tidy(anova_macro_terms) %>% clean_names(),
+          "Table_dbRDA_macronutrient_terms_selected_2024.csv")
+
+write_csv(broom::tidy(anova_micro_terms) %>% clean_names(),
+          "Table_dbRDA_micronutrient_terms_selected_2024.csv")
+
+```
+
+```{r}
+
+# Mechanism: reproductive parameters and key macronutrients
+# + adjusted figure for failed eggs vs sodium and sulfur
+
+
+library(tidyverse)
+library(broom)
+library(patchwork)
+
+
+# 1) Prepare analysis data
+
+dat_nc2 <- dat_nc %>%
+  mutate(
+    nest_depth = to_numeric_comma(nest_depth),
+    total_egg_number = to_numeric_comma(total_egg_number),
+    egg_number_hatched = to_numeric_comma(egg_number_hatched),
+    egg_number_undeveloped = to_numeric_comma(egg_number_undeveloped),
+    failure_unknowncause = to_numeric_comma(failure_unknowncause),
+    hatching_rate = to_numeric_comma(hatching_rate),
+    emergence_rate = to_numeric_comma(emergence_rate),
+    failed_eggs = if_else(
+      is.na(egg_number_undeveloped) & is.na(failure_unknowncause),
+      NA_real_,
+      rowSums(cbind(egg_number_undeveloped, failure_unknowncause), na.rm = TRUE)
+    ),
+    sample_name = as.character(slbez)
+  )
+
+dat_nest <- dat_nc2 %>%
+  filter(sample_type == "nest") %>%
+  mutate(
+    failed_eggs = as.numeric(failed_eggs),
+    total_egg_number = as.numeric(total_egg_number),
+    nest_depth = as.numeric(nest_depth),
+    hatching_rate = as.numeric(hatching_rate),
+    emergence_rate = as.numeric(emergence_rate),
+    na = as.numeric(na),
+    s_icp = as.numeric(s_icp)
+  )
+
+
+# 2) Nutrient–nutrient relationship
+
+cor_na_s <- cor.test(
+  log1p(dat_nest$na),
+  log1p(dat_nest$s_icp),
+  method = "spearman"
+)
+
+fit_na_vs_s <- lm(
+  log1p(na) ~ log1p(s_icp) + nesting_site,
+  data = dat_nest
+)
+
+fit_s_vs_na <- lm(
+  log1p(s_icp) ~ log1p(na) + nesting_site,
+  data = dat_nest
+)
+
+
+# 3) Reproductive mechanism models
+
+fit_na_failed <- lm(
+  log1p(na) ~ failed_eggs + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+fit_s_failed <- lm(
+  log1p(s_icp) ~ failed_eggs + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+fit_na_hatching <- lm(
+  log1p(na) ~ hatching_rate + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+fit_s_hatching <- lm(
+  log1p(s_icp) ~ hatching_rate + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+fit_na_emergence <- lm(
+  log1p(na) ~ emergence_rate + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+fit_s_emergence <- lm(
+  log1p(s_icp) ~ emergence_rate + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+# optional sensitivity model
+fit_na_hatching_full <- lm(
+  log1p(na) ~ hatching_rate + total_egg_number + nest_depth + nesting_site,
+  data = dat_nest
+)
+
+
+# 4) Export summary table
+
+mechanism_table <- bind_rows(
+  broom::tidy(fit_na_failed) %>% mutate(model = "na_failed_eggs"),
+  broom::tidy(fit_s_failed) %>% mutate(model = "s_icp_failed_eggs"),
+  broom::tidy(fit_na_hatching) %>% mutate(model = "na_hatching_rate"),
+  broom::tidy(fit_s_hatching) %>% mutate(model = "s_icp_hatching_rate"),
+  broom::tidy(fit_na_emergence) %>% mutate(model = "na_emergence_rate"),
+  broom::tidy(fit_s_emergence) %>% mutate(model = "s_icp_emergence_rate"),
+  broom::tidy(fit_na_hatching_full) %>% mutate(model = "na_hatching_rate_plus_clutch")
+)
+
+write_csv(mechanism_table, "Table_mechanism_models_sodium_sulfur_2024.csv")
+
+
+# 5) Adjusted prediction data for the main figure
+# failed eggs as focal explanatory variable
+
+make_effect_df <- function(data, model, xvar, nutrient_label) {
+  
+  x_seq <- seq(
+    min(data[[xvar]], na.rm = TRUE),
+    max(data[[xvar]], na.rm = TRUE),
+    length.out = 200
+  )
+  
+  ref_site <- names(sort(table(data$nesting_site), decreasing = TRUE))[1]
+  
+  newdat <- tibble(
+    failed_eggs = x_seq,
+    total_egg_number = median(data$total_egg_number, na.rm = TRUE),
+    nest_depth = median(data$nest_depth, na.rm = TRUE),
+    nesting_site = factor(ref_site, levels = levels(data$nesting_site))
+  )
+  
+  pred <- predict(model, newdata = newdat, se.fit = TRUE)
+  
+  newdat %>%
+    mutate(
+      fit_link = pred$fit,
+      se_link = pred$se.fit,
+      fit = exp(fit_link) - 1,
+      lwr = exp(fit_link - 1.96 * se_link) - 1,
+      upr = exp(fit_link + 1.96 * se_link) - 1,
+      nutrient = nutrient_label
+    )
+}
+
+pred_na <- make_effect_df(
+  data = dat_nest,
+  model = fit_na_failed,
+  xvar = "failed_eggs",
+  nutrient_label = "Sodium"
+)
+
+pred_s <- make_effect_df(
+  data = dat_nest,
+  model = fit_s_failed,
+  xvar = "failed_eggs",
+  nutrient_label = "Sulfur"
+)
+
+
+# 6) Raw point data
+
+points_na <- dat_nest %>%
+  transmute(
+    failed_eggs,
+    nutrient_value = na,
+    nutrient = "Sodium"
+  )
+
+points_s <- dat_nest %>%
+  transmute(
+    failed_eggs,
+    nutrient_value = s_icp,
+    nutrient = "Sulfur"
+  )
+
+points_all <- bind_rows(points_na, points_s)
+pred_all <- bind_rows(pred_na, pred_s)
+
+line_types <- tibble(
+  nutrient = c("Sodium", "Sulfur"),
+  line_type = c("solid", "dashed")
+)
+
+pred_all <- pred_all %>%
+  left_join(line_types, by = "nutrient")
+
+
+# 7) Plotting function
+
+plot_mechanism_adjusted <- function(points_df, pred_df, nutrient_name, ylab_text) {
+  
+  pts <- points_df %>% filter(nutrient == nutrient_name)
+  prd <- pred_df %>% filter(nutrient == nutrient_name)
+  
+  ggplot() +
+    geom_point(
+      data = pts,
+      aes(x = failed_eggs, y = nutrient_value),
+      colour = pal_main["nest"],
+      size = 4.6,
+      alpha = 0.70
+    ) +
+    geom_ribbon(
+      data = prd,
+      aes(x = failed_eggs, ymin = lwr, ymax = upr),
+      fill = pal_main["nest"],
+      alpha = 0.14
+    ) +
+    geom_line(
+      data = prd,
+      aes(x = failed_eggs, y = fit, linetype = line_type),
+      colour = pal_main["nest"],
+      linewidth = 1.2
+    ) +
+    scale_linetype_identity() +
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.12))
+    ) +
+    scale_x_continuous(
+      breaks = scales::pretty_breaks(n = 6)
+    ) +
+    labs(
+      title = nutrient_name,
+      x = "Number of undeveloped eggs",
+      y = ylab_text
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+}
+
+
+# 8) Main mechanism figure
+
+p_na_failed_adj <- plot_mechanism_adjusted(
+  points_df = points_all,
+  pred_df = pred_all,
+  nutrient_name = "Sodium",
+  ylab_text = "mg/100g"
+)
+
+p_s_failed_adj <- plot_mechanism_adjusted(
+  points_df = points_all,
+  pred_df = pred_all,
+  nutrient_name = "Sulfur",
+  ylab_text = "mg/100g"
+)
+
+p_mechanism_main <- p_na_failed_adj | p_s_failed_adj
+
+p_mechanism_main
+
+
+
+# 9) Compact console output
+
+cat("\n============================================================\n")
+cat("Mechanism models: sodium and sulfur in nests\n")
+cat("============================================================\n")
+
+cat("\nSpearman correlation between sodium and sulfur:\n")
+print(cor_na_s)
+
+cat("\nSodium ~ sulfur + site:\n")
+print(summary(fit_na_vs_s))
+
+cat("\nSulfur ~ sodium + site:\n")
+print(summary(fit_s_vs_na))
+
+cat("\nSodium ~ failed eggs + clutch size + nest depth + site:\n")
+print(summary(fit_na_failed))
+
+cat("\nSulfur ~ failed eggs + clutch size + nest depth + site:\n")
+print(summary(fit_s_failed))
+
+cat("\nSodium ~ hatching rate + nest depth + site:\n")
+print(summary(fit_na_hatching))
+
+cat("\nSulfur ~ hatching rate + nest depth + site:\n")
+print(summary(fit_s_hatching))
+
+cat("\nSodium ~ emergence rate + nest depth + site:\n")
+print(summary(fit_na_emergence))
+
+cat("\nSulfur ~ emergence rate + nest depth + site:\n")
+print(summary(fit_s_emergence))
+
+cat("\nSensitivity model: sodium ~ hatching rate + clutch size + nest depth + site:\n")
+print(summary(fit_na_hatching_full))
+```
+
+
+```{r}
+
+# Figure 3: nutrient–microbiome link and mechanism
+# A) dbRDA macronutrients
+# B) dbRDA micronutrients
+# C) Sodium vs failed eggs
+# D) Sulfur vs failed eggs
+
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(grid)
+
+
+# Helper: pretty dbRDA plot
+
+plot_dbrda_selected_pretty <- function(mod, env_df, term_table, title_text) {
+  
+  site_scores <- as.data.frame(scores(mod, display = "sites", choices = 1:2)) %>%
+    rownames_to_column("row_id")
+  colnames(site_scores)[2:3] <- c("CAP1", "CAP2")
+  
+  site_scores <- site_scores %>%
+    mutate(
+      sample_type = env_df$sample_type,
+      nesting_site = env_df$nesting_site,
+      sample_name = env_df$sample_name
+    )
+  
+  bp_raw <- as.data.frame(scores(mod, display = "bp", choices = 1:2)) %>%
+    rownames_to_column("variable_raw")
+  colnames(bp_raw)[2:3] <- c("CAP1", "CAP2")
+  
+  bp_raw <- bp_raw %>%
+    mutate(
+      variable = stringr::str_remove_all(variable_raw, "log1p\\(|\\)")
+    )
+  
+  term_pvals <- as.data.frame(term_table) %>%
+    rownames_to_column("term") %>%
+    as_tibble() %>%
+    filter(term != "Residual") %>%
+    transmute(
+      variable = stringr::str_remove_all(term, "log1p\\(|\\)"),
+      p_value = .data[["Pr(>F)"]]
+    )
+  
+  bp_scores <- bp_raw %>%
+    left_join(term_pvals, by = "variable") %>%
+    mutate(
+      variable_label = recode(variable, !!!nutrient_labels, .default = variable)
+    ) %>%
+    filter(!is.na(p_value), p_value < 0.05) %>%
+    mutate(
+      CAP1 = CAP1 * 1.18,
+      CAP2 = CAP2 * 1.18,
+      lab_x = CAP1 * 1.12,
+      lab_y = CAP2 * 1.12
+    ) %>%
+    mutate(
+      lab_x = case_when(
+        variable == "na" ~ CAP1 * 2.50,
+        TRUE ~ lab_x
+      ),
+      lab_y = case_when(
+        variable == "na" ~ CAP2 * 3.00,
+        TRUE ~ lab_y
+      )
+    )
+  
+  eig_vals <- eigenvals(mod)
+  axis1 <- round(100 * eig_vals[1] / sum(eig_vals[eig_vals > 0]), 1)
+  axis2 <- round(100 * eig_vals[2] / sum(eig_vals[eig_vals > 0]), 1)
+  
+  p <- ggplot(site_scores, aes(x = CAP1, y = CAP2)) +
+    stat_ellipse(
+      aes(colour = sample_type),
+      geom = "path",
+      linewidth = 1.2,
+      type = "norm",
+      alpha = 0.9
+    ) +
+    geom_point(
+      aes(colour = sample_type),
+      size = 5.2,
+      alpha = 0.70
+    ) +
+    scale_colour_manual(values = pal_main) +
+    labs(
+      title = title_text,
+      x = paste0("dbRDA1 (", axis1, "%)"),
+      y = paste0("dbRDA2 (", axis2, "%)")
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+  
+  if (nrow(bp_scores) > 0) {
+    p <- p +
+      geom_segment(
+        data = bp_scores,
+        aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
+        inherit.aes = FALSE,
+        arrow = arrow(length = unit(0.20, "cm")),
+        linewidth = 0.9,
+        colour = "grey30",
+        alpha = 0.95
+      ) +
+      ggrepel::geom_label_repel(
+        data = bp_scores,
+        aes(x = lab_x, y = lab_y, label = variable_label),
+        inherit.aes = FALSE,
+        size = 3.6,
+        linewidth = 0,
+        fill = scales::alpha("white", 0.88),
+        colour = "grey15",
+        box.padding = 0.25,
+        point.padding = 0.15,
+        segment.color = "grey50",
+        segment.size = 0.3,
+        min.segment.length = 0,
+        seed = 123
+      )
+  }
+  
+  p
+}
+
+
+# Helper: adjusted mechanism plot
+
+plot_mechanism_adjusted <- function(points_df, pred_df, nutrient_name, ylab_text) {
+  
+  pts <- points_df %>% filter(nutrient == nutrient_name)
+  prd <- pred_df %>% filter(nutrient == nutrient_name)
+  
+  ggplot() +
+    geom_point(
+      data = pts,
+      aes(x = failed_eggs, y = nutrient_value),
+      colour = pal_main["nest"],
+      size = 4.6,
+      alpha = 0.70
+    ) +
+    geom_ribbon(
+      data = prd,
+      aes(x = failed_eggs, ymin = lwr, ymax = upr),
+      fill = pal_main["nest"],
+      alpha = 0.14
+    ) +
+    geom_line(
+      data = prd,
+      aes(x = failed_eggs, y = fit, linetype = line_type),
+      colour = pal_main["nest"],
+      linewidth = 1.2
+    ) +
+    scale_linetype_identity() +
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.12))
+    ) +
+    scale_x_continuous(
+      breaks = scales::pretty_breaks(n = 6)
+    ) +
+    labs(
+      title = nutrient_name,
+      x = "Number of undeveloped eggs",
+      y = ylab_text
+    ) +
+    theme_pub +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold")
+    )
+}
+
+
+# A + B: dbRDA plots
+
+p_fig3_a <- plot_dbrda_selected_pretty(
+  mod = mod_sel_macro,
+  env_df = env_macro,
+  term_table = anova_macro_terms,
+  title_text = "Macronutrient gradients"
+)
+
+p_fig3_b <- plot_dbrda_selected_pretty(
+  mod = mod_sel_micro,
+  env_df = env_micro,
+  term_table = anova_micro_terms,
+  title_text = "Micronutrient gradients"
+)
+
+# collect legend only once for A + B
+p_fig3_top <- (p_fig3_a | p_fig3_b) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center"
+  )
+
+
+# C + D: mechanism plots
+
+p_fig3_c <- plot_mechanism_adjusted(
+  points_df = points_all,
+  pred_df = pred_all,
+  nutrient_name = "Sodium",
+  ylab_text = "mg/100g"
+)
+
+p_fig3_d <- plot_mechanism_adjusted(
+  points_df = points_all,
+  pred_df = pred_all,
+  nutrient_name = "Sulfur",
+  ylab_text = "mg/100g"
+)
+
+p_fig3_bottom <- p_fig3_c | p_fig3_d
+
+
+# Assemble Figure 3
+
+p_fig3 <- p_fig3_top / p_fig3_bottom +
+  plot_annotation(tag_levels = "A")
+
+p_fig3
+
+
+
+```
+
